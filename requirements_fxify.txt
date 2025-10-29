@@ -1,0 +1,15 @@
+# FXIFY Trading Bot Requirements
+# Install with: pip install -r requirements_fxify.txt
+
+# MetaTrader 5
+MetaTrader5>=5.0.45
+
+# Data processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Optional: For enhanced logging
+colorlog>=6.7.0
