@@ -1,5 +1,20 @@
 # General Trading Bot (FX, Gold, Crypto) – Backtesting + Live (MT5)
 
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platform-Backtest%3A%20Win%2FLinux%20%7C%20Live%3A%20Windows-informational.svg)](#)
+[![Trading](https://img.shields.io/badge/domain-trading%2Fbacktesting-blue.svg)](#)
+[![MT5](https://img.shields.io/badge/execution-MetaTrader5-orange.svg)](#)
+[![Data](https://img.shields.io/badge/data-Yahoo%20Finance%20%2B%20CSV-yellowgreen.svg)](#)
+
+High‑confidence 15m portfolio framework with session‑aware entries, tight risk controls, and optional ML gating. Backtests run on any OS; live execution mirrors the rules on Windows via MT5.
+
+Highlights
+- Low drawdown profile: per‑trade risk 0.25–0.30%, 1.0% max concurrent, −3% daily stop
+- Quality filters that reduce chop (ADX, ATR% by symbol, min MA distance)
+- Cleaner exits: break‑even at +1R, ATR trail from +1.5R, partials at +2R; optional micro‑pyramiding to compound winners
+- Works out‑of‑the‑box for XAUUSD, USDJPY, ETHUSD; easy to extend to other assets/timeframes
+
 Production‑ready backtesting and live‑trading framework focused on robust risk controls, session‑aware entries, and optional ML gating. Works out‑of‑the‑box for USDJPY, XAUUSD (Gold), ETHUSD on 15m; easily adaptable to other assets/timeframes.
 
 ## Features
