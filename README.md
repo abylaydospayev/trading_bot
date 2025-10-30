@@ -93,6 +93,14 @@ ml/
   infer.py                       # model loading + predict_entry_prob interface
 strategy/
   indicators.py, edge.py         # indicator suite and edge scoring
+
+## Alpaca (paper) mode
+
+If you’ve run a similar bot on Replit with Alpaca, see `docs/ALPACA_NOTES.md` for:
+- Quick setup (API keys, paper endpoint)
+- Known startup reconciliation fix (treat 404 "position does not exist" as no position)
+- Example logs and how to capture a result screenshot for your portfolio section
+
 ```
 
 ## Architecture

@@ -1,0 +1,22 @@
+{
+  "description": "FTMO mode 15m portfolio: ADX≥27, MA≥12bps, ATR=2.5, ETH-only ML (0.28), FTMO loss rules (daily 5%, overall 10%, Europe/Prague reset).",
+  "symbols": "XAUUSD,USDJPY,ETHUSD",
+  "timeframe": "15m",
+  "capital": 100000.0,
+  "risk_pct": 0.003,
+  "atr_mult": 2.5,
+  "adx_threshold": 27,
+  "min_ma_dist_bps": 12,
+  "ml_enable": true,
+  "ml_model": "ml/models/mlp_thr005.pkl",
+  "ml_eth_threshold": 0.28,
+  "pyramid_enable": true,
+  "pyramid_step_risk": 0.0012,
+  "pyramid_max_total_risk": 0.006,
+  "start": "2025-09-01",
+  "sim_start": "2025-09-29",
+  "sim_end": "2025-10-28",
+  "ftmo": true,
+  "day_reset_tz": "Europe/Prague",
+  "max_loss_pct": 0.10
+}

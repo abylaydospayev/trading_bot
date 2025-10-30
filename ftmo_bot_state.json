@@ -1,0 +1,23 @@
+{
+  "in_position": false,
+  "position_qty": 0.0,
+  "position_ticket": null,
+  "entry_price": 0.0,
+  "entry_atr": 0.0,
+  "trade_high_price": 0.0,
+  "trade_low_price": 0.0,
+  "entry_time": null,
+  "partial_profit_taken": false,
+  "edge_buy_streak": 0,
+  "edge_exit_streak": 0,
+  "last_trade_ts": null,
+  "trades_today": 0,
+  "trades_day_str": "2025-10-30T00:07:02.009166+00:00",
+  "loss_streak": 0,
+  "circuit_breaker_until": null,
+  "last_stop_price": null,
+  "initial_balance": 100000.0,
+  "day_start_equity": 99999.58,
+  "high_water_mark": 100000.0,
+  "total_profit": 0.0
+}

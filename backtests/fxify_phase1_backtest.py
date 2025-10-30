@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
+import pytz
 
 import numpy as np
 import pandas as pd
@@ -66,9 +67,17 @@ ACTIVE_HOUR_END = 15        # 15:00 UTC inclusive
 DAILY_STOP_PCT = 0.03       # Hard daily stop at -3.0%
 
 # Quality filters (defaults within requested ranges)
-ATR_PCT_THR = 0.40          # Default if no symbol-specific rule (% units)
+ATR_PCT_THR = 0.40          # Legacy single-sided threshold (% units)
 ADX_THR = 25                # Require ADX >= 24–26
 MIN_MA_DIST_BPS = 10        # Min MA distance in basis points (bps)
+# New banded ATR filter and MA normalization defaults (align with live bot)
+ATR_PCT_MIN = 0.04          # 0.04%
+ATR_PCT_MAX = 0.20          # 0.20%
+ADAPTIVE_MABPS_ENABLE = False
+ADAPTIVE_MABPS_COEFF = 0.35
+ADAPTIVE_MABPS_FLOOR_BPS = 1.0
+MA_NORM_MIN_OFFHOURS = 0.6
+OFFHOURS_STRICT_ADX_MIN = 28
 
 # Stop/trailing tuning
 ATR_MULT = 2.4              # 2.2–2.5x ATR
@@ -153,6 +162,7 @@ def download_yf(symbol: str, start: Optional[str], timeframe: str) -> Optional[p
         return None
     for tkr in _yf_candidates(symbol):
         try:
+            # Note: We only pass start here; optional sim window slicing can be applied later
             df = yf.download(tkr, start=start, interval=timeframe, progress=False, auto_adjust=False, actions=False)
             if df is None or df.empty:
                 continue
@@ -226,7 +236,8 @@ class Trade:
 # -------------------- Backtest engine --------------------
 
 def is_session_open(symbol: str, ts: pd.Timestamp) -> bool:
-    s = symbol.upper()
+    # Normalize broker variants like EURUSD.sim -> EURUSD
+    s = symbol.upper().split('.')[0]
     h = ts.hour
     wd = ts.weekday()  # Mon=0 ... Sun=6
     if s == "USDJPY":
@@ -244,13 +255,15 @@ def is_session_open(symbol: str, ts: pd.Timestamp) -> bool:
     return (ACTIVE_HOUR_START <= h <= ACTIVE_HOUR_END)
 
 def _atr_pct_threshold(symbol: str, default_thr: float) -> float:
-    s = symbol.upper()
+    s = symbol.upper().split('.')[0]
     # Symbol-normalized defaults (can be overridden globally via CLI)
     if default_thr != ATR_PCT_THR:
         # User provided override; honor it for all symbols
         return default_thr
     if s == "USDJPY":
         return 0.06  # ~6 bps for 15m
+    if s == "EURUSD":
+        return 0.04  # ~4 bps for 15m
     if s == "XAUUSD":
         return 0.25
     if s in ("ETHUSD", "ETH-USD"):
@@ -317,10 +330,29 @@ def simulate_portfolio(
     pyramid_max_total_risk: float = 0.006,
     # Filters and stops
     adx_thr: float = ADX_THR,
-    atr_pct_thr: float = ATR_PCT_THR,
+    atr_pct_thr: float = ATR_PCT_THR,  # legacy; if atr_pct_min/max provided, those take precedence
     min_ma_dist_bps: float = MIN_MA_DIST_BPS,
+    # New gates
+    atr_pct_min: float = ATR_PCT_MIN,
+    atr_pct_max: float = ATR_PCT_MAX,
+    adaptive_mabps_enable: bool = ADAPTIVE_MABPS_ENABLE,
+    adaptive_mabps_coeff: float = ADAPTIVE_MABPS_COEFF,
+    adaptive_mabps_floor_bps: float = ADAPTIVE_MABPS_FLOOR_BPS,
+    ma_norm_min_offhours: float = MA_NORM_MIN_OFFHOURS,
+    offhours_strict_adx_min: float = OFFHOURS_STRICT_ADX_MIN,
     atr_mult: float = ATR_MULT,
     daily_stop_pct: float = DAILY_STOP_PCT,
+    # FTMO/prop-style controls
+    day_reset_tz: str = "UTC",
+    max_loss_pct: Optional[float] = None,
+    # Off-hours/always-active controls
+    always_active: bool = False,
+    edge_buy_score: float = EDGE_BUY_SCORE,
+    offhours_edge_buy_score: Optional[float] = None,
+    offhours_adx_thr: Optional[float] = None,
+    offhours_atr_pct_thr: Optional[float] = None,
+    # Session-specific tweaks
+    usdjpy_asia_ma_bps: Optional[float] = None,
 ) -> Tuple[pd.Series, List[Trade]]:
     # Precompute indicators
     ind: Dict[str, pd.DataFrame] = {s: build_indicators(df) for s, df in data.items()}
@@ -342,13 +374,24 @@ def simulate_portfolio(
     # Daily tracking for hard stop
     day_start_equity: Optional[float] = None
     daily_blocked: bool = False
+    overall_breached: bool = False
+
+    # Helper to compute day key in reset TZ
+    try:
+        reset_tz = pytz.timezone(day_reset_tz)
+    except Exception:
+        reset_tz = pytz.UTC
+    def day_key(ts: pd.Timestamp) -> datetime.date:
+        if ts.tzinfo is None:
+            ts = ts.tz_localize('UTC')
+        return ts.tz_convert(reset_tz).date()
 
     for t in all_times:
         # Reset day counters
-        if (last_day is None) or (t.date() != last_day):
+        if (last_day is None) or (day_key(t) != last_day):
             for s in ind:
                 trades_today[s] = 0
-            last_day = t.date()
+            last_day = day_key(t)
             day_start_equity = None
             daily_blocked = False
 
@@ -373,6 +416,33 @@ def simulate_portfolio(
         # Enforce hard daily stop: block new entries for the rest of the day
         if (equity / max(day_start_equity, EPS) - 1.0) <= -daily_stop_pct:
             daily_blocked = True
+
+        # Enforce overall max loss (from initial capital)
+        if (max_loss_pct is not None) and ((equity / max(capital, EPS) - 1.0) <= -max_loss_pct):
+            overall_breached = True
+            # Liquidate all positions and end simulation
+            for s, pos in list(positions.items()):
+                df = ind[s]
+                if t in df.index:
+                    price = float(df.loc[t, 'close'])
+                else:
+                    price = float(df['close'].loc[:t].iloc[-1])
+                pnl = pos.qty * (price - pos.entry_price)
+                cash += pnl + pos.qty * price
+                trades.append(Trade(
+                    symbol=s,
+                    entry_time=pos.entry_time,
+                    entry_price=pos.entry_price,
+                    exit_time=t,
+                    exit_price=price,
+                    qty=pos.qty,
+                    pnl=pnl,
+                    r_multiple=(price - pos.entry_price) / max(pos.entry_atr * atr_mult, EPS),
+                    reason="OverallMaxLossStop"
+                ))
+                del positions[s]
+            # After breach, stop processing further entries/exits
+            break
 
         # Manage each symbol independently
         for s, df in ind.items():
@@ -497,8 +567,12 @@ def simulate_portfolio(
                     del positions[s]
                     continue
 
-            # Entry logic (only during symbol session, not news blackout, and if no open position)
-            if s not in positions and is_session_open(s, t) and not daily_blocked and not is_news_blackout(t, s, news_df, news_window_min):
+            # Entry logic: during symbol session (or off-hours if always_active), not news blackout, and if no open position
+            if overall_breached:
+                continue
+            session_ok = is_session_open(s, t)
+            allowed = session_ok or bool(always_active)
+            if s not in positions and allowed and not daily_blocked and not is_news_blackout(t, s, news_df, news_window_min):
                 # Daily trade cap per symbol
                 if trades_today[s] >= MAX_TRADES_PER_DAY:
                     continue
@@ -511,18 +585,53 @@ def simulate_portfolio(
 
                 # Filters
                 uptrend = price > row["trend_ma"]
-                adx_ok = row["adx"] >= adx_thr
-                atr_thr = _atr_pct_threshold(s, atr_pct_thr)
-                atr_ok = row.get("atr_pct", np.nan) >= atr_thr
-                # Min MA distance in bps
+                # Choose thresholds based on session vs off-hours
+                eff_adx_thr = adx_thr
+                # ATR threshold handling: prefer band if provided, else legacy per-symbol thr
+                eff_atr_pct_thr = _atr_pct_threshold(s, atr_pct_thr)
+                eff_edge_buy_score = edge_buy_score
+                if not session_ok and always_active:
+                    if offhours_adx_thr is not None:
+                        eff_adx_thr = float(offhours_adx_thr)
+                    # Strict off-hours ADX minimum
+                    eff_adx_thr = max(eff_adx_thr, offhours_strict_adx_min)
+                    if offhours_atr_pct_thr is not None:
+                        eff_atr_pct_thr = float(offhours_atr_pct_thr)
+                    if offhours_edge_buy_score is not None:
+                        eff_edge_buy_score = float(offhours_edge_buy_score)
+
+                adx_ok = row["adx"] >= eff_adx_thr
+                # ATR band check if provided, else fallback to legacy single threshold
+                atr_val = float(row.get("atr_pct", np.nan))
+                if np.isfinite(atr_pct_min) and np.isfinite(atr_pct_max):
+                    atr_ok = (atr_val >= atr_pct_min) and (atr_val <= atr_pct_max)
+                else:
+                    atr_thr = eff_atr_pct_thr
+                    atr_ok = atr_val >= atr_thr
+                # Min MA distance in bps (with optional Asia-session easing for USDJPY) and dynamic floor
                 ma_dist_bps_calc = abs(row["short_ma"] - row["long_ma"]) / max(price, EPS) * 10000.0
-                ma_ok = ma_dist_bps_calc >= min_ma_dist_bps
+                # Dynamic floor from ATR% (convert to bps via *100)
+                dyn_floor = max(adaptive_mabps_floor_bps, adaptive_mabps_coeff * (atr_val * 100.0))
+                eff_min_ma_bps = max(min_ma_dist_bps, dyn_floor) if adaptive_mabps_enable else min_ma_dist_bps
+                if s.upper().split('.')[0] == "USDJPY":
+                    h = t.hour
+                    if 0 <= h <= 6 and usdjpy_asia_ma_bps is not None:
+                        try:
+                            eff_min_ma_bps = float(usdjpy_asia_ma_bps)
+                        except Exception:
+                            eff_min_ma_bps = min_ma_dist_bps
+                ma_norm = ma_dist_bps_calc / max(dyn_floor, EPS)
+                if (not session_ok) and always_active:
+                    # Off-hours acceptance path similar to live: normalized MA or raw floor
+                    ma_ok = (ma_norm >= ma_norm_min_offhours) or (ma_dist_bps_calc >= eff_min_ma_bps)
+                else:
+                    ma_ok = ma_dist_bps_calc >= eff_min_ma_bps
 
                 edge = compute_edge_features_and_score(df.iloc[: i + 1], row, prev, 0.0, 20.0)
 
                 # ML gating (optional)
                 ml_ok = True
-                s_up = s.upper()
+                s_up = s.upper().split('.')[0]
                 do_ml = False
                 thr = ml_threshold
                 if s_up in ("ETHUSD", "ETH-USD") and ml_eth_enable:
@@ -539,7 +648,7 @@ def simulate_portfolio(
                     except Exception:
                         ml_ok = False
 
-                if edge.score >= EDGE_BUY_SCORE and uptrend and adx_ok and atr_ok and ma_ok and ml_ok:
+                if edge.score >= eff_edge_buy_score and uptrend and adx_ok and atr_ok and ma_ok and ml_ok:
                     buy_streak[s] += 1
                 else:
                     buy_streak[s] = 0
@@ -571,7 +680,7 @@ def simulate_portfolio(
                 pos = positions[s]
                 initial_r = pos.entry_atr * atr_mult
                 r_mult = (price - pos.entry_price) / max(initial_r, EPS)
-                s_up = s.upper()
+                s_up = s.upper().split('.')[0]
                 # Per-symbol total cap
                 current_sym_risk = pos.initial_risk + getattr(pos, "added_risk", 0.0)
                 sym_cap = pyramid_max_total_risk * equity
@@ -630,18 +739,48 @@ def simulate_portfolio(
 
 def summarize(equity: pd.Series, trades: List[Trade]) -> Dict[str, float]:
     if equity.empty:
-        return {"return_pct": 0.0, "max_dd_pct": 0.0, "sharpe": 0.0, "trades": 0, "win_rate": 0.0, "pf": 0.0}
+        return {
+            "return_pct": 0.0,
+            "max_dd_pct": 0.0,
+            "sharpe": 0.0,
+            "trades": 0,
+            "win_rate": 0.0,
+            "pf": 0.0,
+            "trades_excl_adds": 0,
+            "win_rate_excl_adds": 0.0,
+            "pf_excl_adds": 0.0,
+        }
     ret = (equity.iloc[-1] / equity.iloc[0] - 1.0) * 100
     running_max = equity.cummax()
     dd = ((equity - running_max) / running_max).min() * 100
     rets = equity.pct_change().dropna()
-    sharpe = float(np.sqrt(252 * 24 * 4) * rets.mean() / (rets.std(ddof=0) + EPS)) if len(rets) else 0.0  # 15m ~ 4*24 bars/day
+    # 15m ~ 4*24 bars/day; for other TFs, this scaling is approximate but consistent across runs
+    sharpe = float(np.sqrt(252 * 24 * 4) * rets.mean() / (rets.std(ddof=0) + EPS)) if len(rets) else 0.0
+
     closed = trades
     wins = [t for t in closed if t.pnl > 0]
     losses = [t for t in closed if t.pnl < 0]
     win_rate = 100.0 * len(wins) / max(len(closed), 1)
     pf = (sum(t.pnl for t in wins) / max(sum(-t.pnl for t in losses), EPS)) if losses else float("inf")
-    return {"return_pct": ret, "max_dd_pct": float(dd), "sharpe": sharpe, "trades": len(closed), "win_rate": win_rate, "pf": pf}
+
+    # Exclude pyramid adds (zero-PnL bookkeeping) for a more interpretable win rate
+    closed_excl_adds = [t for t in closed if t.reason != "PyramidAdd"]
+    wins_excl = [t for t in closed_excl_adds if t.pnl > 0]
+    losses_excl = [t for t in closed_excl_adds if t.pnl < 0]
+    win_rate_excl = 100.0 * len(wins_excl) / max(len(closed_excl_adds), 1)
+    pf_excl = (sum(t.pnl for t in wins_excl) / max(sum(-t.pnl for t in losses_excl), EPS)) if losses_excl else float("inf")
+
+    return {
+        "return_pct": ret,
+        "max_dd_pct": float(dd),
+        "sharpe": sharpe,
+        "trades": len(closed),
+        "win_rate": win_rate,
+        "pf": pf,
+        "trades_excl_adds": len(closed_excl_adds),
+        "win_rate_excl_adds": win_rate_excl,
+        "pf_excl_adds": pf_excl,
+    }
 
 
 def save_reports(output_root: Path, symbol: str, equity: pd.Series, trades: List[Trade]) -> None:
@@ -672,19 +811,41 @@ def main():
     ap.add_argument("--ml-usdjpy-enable", action="store_true", default=False)
     ap.add_argument("--ml-xauusd-enable", action="store_true", default=False)
     ap.add_argument("--start", default=None, help="Optional start date for yfinance fallback")
+    # Optional simulation window (slice after loading data)
+    ap.add_argument("--sim-start", default=None, help="Optional simulation start (YYYY-MM-DD or timestamp)")
+    ap.add_argument("--sim-end", default=None, help="Optional simulation end (YYYY-MM-DD or timestamp)")
     # Filters and stops
     ap.add_argument("--adx-threshold", type=float, default=ADX_THR)
     ap.add_argument("--atr-pct-threshold", type=float, default=ATR_PCT_THR)
     ap.add_argument("--min-ma-dist-bps", type=float, default=MIN_MA_DIST_BPS)
     ap.add_argument("--atr-mult", type=float, default=ATR_MULT)
     ap.add_argument("--daily-stop-pct", type=float, default=DAILY_STOP_PCT)
+    # New live-aligned gates
+    ap.add_argument("--atr-pct-min", type=float, default=ATR_PCT_MIN)
+    ap.add_argument("--atr-pct-max", type=float, default=ATR_PCT_MAX)
+    ap.add_argument("--adaptive-mabps-enable", action="store_true", default=ADAPTIVE_MABPS_ENABLE)
+    ap.add_argument("--adaptive-mabps-coeff", type=float, default=ADAPTIVE_MABPS_COEFF)
+    ap.add_argument("--adaptive-mabps-floor-bps", type=float, default=ADAPTIVE_MABPS_FLOOR_BPS)
+    ap.add_argument("--ma-norm-min-offhours", type=float, default=MA_NORM_MIN_OFFHOURS)
+    ap.add_argument("--offhours-strict-adx-min", type=float, default=OFFHOURS_STRICT_ADX_MIN)
     # News calendar
     ap.add_argument("--news-calendar", default="backtests/data/tier1_news.csv")
     ap.add_argument("--news-window", type=int, default=10)
+    # FTMO/prop-style controls
+    ap.add_argument("--day-reset-tz", default="UTC", help="Timezone name for daily reset (e.g., Europe/Prague for FTMO)")
+    ap.add_argument("--max-loss-pct", type=float, default=None, help="Overall max loss from initial capital; liquidates and stops if breached")
+    ap.add_argument("--ftmo", action="store_true", help="Shortcut: set daily-stop-pct=0.05, day-reset-tz=Europe/Prague, max-loss-pct=0.10")
     # Pyramiding
     ap.add_argument("--pyramid-enable", action="store_true")
     ap.add_argument("--pyramid-step-risk", type=float, default=0.0015)
     ap.add_argument("--pyramid-max-total-risk", type=float, default=0.006)
+    # Off-hours / Always-active controls (to simulate live behavior)
+    ap.add_argument("--always-active", action="store_true", help="Allow entries off-hours; applies off-hours thresholds if provided")
+    ap.add_argument("--offhours-edge-buy-score", type=float, default=None, help="Edge score threshold off-hours (default: same as EDGE_BUY_SCORE)")
+    ap.add_argument("--offhours-adx-threshold", type=float, default=None, help="ADX threshold off-hours (default: same as --adx-threshold)")
+    ap.add_argument("--offhours-atr-pct-threshold", type=float, default=None, help="ATR%% threshold off-hours (default: same as --atr-pct-threshold)")
+    # Session-specific tweaks
+    ap.add_argument("--usdjpy-asia-ma-bps", type=float, default=None, help="USDJPY Asia (00-06 UTC) min MA distance bps override")
     args = ap.parse_args()
 
     tf = args.timeframe.lower()
@@ -712,11 +873,37 @@ def main():
             continue
         data[s] = ds
 
+    # Apply optional simulation window slice
+    sim_start = pd.to_datetime(args.sim_start, utc=True, errors="coerce").tz_convert(None) if args.sim_start else None
+    sim_end = pd.to_datetime(args.sim_end, utc=True, errors="coerce").tz_convert(None) if args.sim_end else None
+    if sim_start is not None or sim_end is not None:
+        sliced: Dict[str, pd.DataFrame] = {}
+        for s, df in data.items():
+            df2 = df.copy()
+            if sim_start is not None:
+                df2 = df2[df2.index >= sim_start]
+            if sim_end is not None:
+                df2 = df2[df2.index <= sim_end]
+            if df2.empty:
+                print(f"⚠️ After slicing, no data remains for {s}; skipping.")
+                continue
+            sliced[s] = df2
+        data = sliced
+
     if not data:
         print("No datasets loaded. Exiting.")
         sys.exit(1)
 
     news_df = _load_news_calendar(Path(args.news_calendar))
+
+    # FTMO shortcut mapping
+    day_reset_tz = args.day_reset_tz
+    daily_stop_pct = float(args.daily_stop_pct)
+    max_loss_pct = args.max_loss_pct
+    if args.ftmo:
+        day_reset_tz = "Europe/Prague"
+        daily_stop_pct = 0.05
+        max_loss_pct = 0.10 if max_loss_pct is None else max_loss_pct
 
     equity, trades = simulate_portfolio(
         data,
@@ -738,8 +925,23 @@ def main():
         adx_thr=float(args.adx_threshold),
         atr_pct_thr=float(args.atr_pct_threshold),
         min_ma_dist_bps=float(args.min_ma_dist_bps),
+    atr_pct_min=float(args.atr_pct_min),
+    atr_pct_max=float(args.atr_pct_max),
+    adaptive_mabps_enable=bool(args.adaptive_mabps_enable),
+    adaptive_mabps_coeff=float(args.adaptive_mabps_coeff),
+    adaptive_mabps_floor_bps=float(args.adaptive_mabps_floor_bps),
+    ma_norm_min_offhours=float(args.ma_norm_min_offhours),
+    offhours_strict_adx_min=float(args.offhours_strict_adx_min),
         atr_mult=float(args.atr_mult),
         daily_stop_pct=float(args.daily_stop_pct),
+        day_reset_tz=day_reset_tz,
+        max_loss_pct=(float(max_loss_pct) if max_loss_pct is not None else None),
+        always_active=bool(args.always_active),
+        edge_buy_score=float(EDGE_BUY_SCORE),
+        offhours_edge_buy_score=(float(args.offhours_edge_buy_score) if args.offhours_edge_buy_score is not None else None),
+        offhours_adx_thr=(float(args.offhours_adx_threshold) if args.offhours_adx_threshold is not None else None),
+        offhours_atr_pct_thr=(float(args.offhours_atr_pct_threshold) if args.offhours_atr_pct_threshold is not None else None),
+        usdjpy_asia_ma_bps=(float(args.usdjpy_asia_ma_bps) if args.usdjpy_asia_ma_bps is not None else None),
     )
 
     # Report
@@ -750,6 +952,8 @@ def main():
     print(f"Symbols: {', '.join(data.keys())}")
     print(f"Capital: ${args.capital:,.2f} | Risk/Trade: {args.risk_pct*100:.2f}% | Max Concurrent Risk: {MAX_TOTAL_RISK*100:.2f}%")
     print(f"Return: {summary['return_pct']:+.2f}% | MaxDD: {summary['max_dd_pct']:.2f}% | Sharpe: {summary['sharpe']:.2f} | Trades: {summary['trades']} | WinRate: {summary['win_rate']:.1f}% | PF: {summary['pf']:.2f}")
+    # Also report a cleaner win rate excluding pyramid adds (zero-PnL rows)
+    print(f"WinRate (excl adds): {summary['win_rate_excl_adds']:.1f}% | Trades (excl adds): {summary['trades_excl_adds']} | PF (excl adds): {summary['pf_excl_adds']:.2f}")
 
     # Save per-symbol reports by re-simulating individually for detail (faster than tracking during multi-sim)
     for s, df in data.items():
@@ -773,8 +977,23 @@ def main():
             adx_thr=float(args.adx_threshold),
             atr_pct_thr=float(args.atr_pct_threshold),
             min_ma_dist_bps=float(args.min_ma_dist_bps),
+            atr_pct_min=float(args.atr_pct_min),
+            atr_pct_max=float(args.atr_pct_max),
+            adaptive_mabps_enable=bool(args.adaptive_mabps_enable),
+            adaptive_mabps_coeff=float(args.adaptive_mabps_coeff),
+            adaptive_mabps_floor_bps=float(args.adaptive_mabps_floor_bps),
+            ma_norm_min_offhours=float(args.ma_norm_min_offhours),
+            offhours_strict_adx_min=float(args.offhours_strict_adx_min),
             atr_mult=float(args.atr_mult),
-            daily_stop_pct=float(args.daily_stop_pct),
+            daily_stop_pct=daily_stop_pct,
+            day_reset_tz=day_reset_tz,
+            max_loss_pct=(float(max_loss_pct) if max_loss_pct is not None else None),
+            always_active=bool(args.always_active),
+            edge_buy_score=float(EDGE_BUY_SCORE),
+            offhours_edge_buy_score=(float(args.offhours_edge_buy_score) if args.offhours_edge_buy_score is not None else None),
+            offhours_adx_thr=(float(args.offhours_adx_threshold) if args.offhours_adx_threshold is not None else None),
+            offhours_atr_pct_thr=(float(args.offhours_atr_pct_threshold) if args.offhours_atr_pct_threshold is not None else None),
+            usdjpy_asia_ma_bps=(float(args.usdjpy_asia_ma_bps) if args.usdjpy_asia_ma_bps is not None else None),
         )
         save_reports(output_root, s, es, trs)
 

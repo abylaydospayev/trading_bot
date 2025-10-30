@@ -1,0 +1,19 @@
+{
+  "description": "Baseline 15m portfolio (XAUUSD, USDJPY, ETHUSD) with conservative risk; pyramiding OFF; filters at defaults.",
+  "symbols": "XAUUSD,USDJPY,ETHUSD",
+  "timeframe": "15m",
+  "capital": 100000.0,
+  "risk_pct": 0.003,
+  "atr_mult": 2.5,
+  "adx_threshold": 25,
+  "min_ma_dist_bps": 10,
+  "ml_enable": false,
+  "ml_model": "ml/models/mlp_thr005.pkl",
+  "ml_eth_threshold": 0.28,
+  "pyramid_enable": false,
+  "pyramid_step_risk": 0.0015,
+  "pyramid_max_total_risk": 0.006,
+  "start": "2025-09-01",
+  "sim_start": "2025-09-01",
+  "sim_end": "2025-10-28"
+}

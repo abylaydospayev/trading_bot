@@ -23,6 +23,8 @@ Thumbs.db
 
 # Local configs
 .env
+.env.fxify
+configs/live/*.env
 *.log
 logs/
 

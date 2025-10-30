@@ -1,0 +1,2 @@
+# Runs baseline 15m portfolio backtest
+python backtests/fxify_phase1_backtest.py --symbols XAUUSD,USDJPY,ETHUSD --timeframe 15m --capital 100000 --risk-pct 0.003 --atr-mult 2.5 --adx-threshold 25 --min-ma-dist-bps 10 --start 2025-09-01 --sim-start 2025-09-01 --sim-end 2025-10-28

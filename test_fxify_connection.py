@@ -15,11 +15,14 @@ if ROOT_DIR not in sys.path:
 def test_mt5_connection():
     """Test MT5 connection"""
     try:
-        import MetaTrader5 as mt5
+        import MetaTrader5 as mt5  # preferred module name
     except ImportError:
-        print("❌ MetaTrader5 module not installed")
-        print("   Run: pip install MetaTrader5")
-        return False
+        try:
+            import metatrader5 as mt5  # fallback package name on some installs
+        except Exception:
+            print("❌ MetaTrader5 module not installed")
+            print("   Run: pip install MetaTrader5")
+            return False
     
     load_dotenv(".env.fxify")
     
@@ -74,7 +77,10 @@ def test_symbol_access():
     try:
         import MetaTrader5 as mt5
     except ImportError:
-        return False
+        try:
+            import metatrader5 as mt5
+        except Exception:
+            return False
     
     load_dotenv(".env.fxify")
     SYMBOL = os.getenv("SYMBOL", "EURUSD")
@@ -84,19 +90,27 @@ def test_symbol_access():
     
     print(f"\nTesting symbol: {SYMBOL}")
     
-    symbol_info = mt5.symbol_info(SYMBOL)
+    symbol_name = SYMBOL
+    symbol_info = mt5.symbol_info(symbol_name)
     if symbol_info is None:
-        print(f"❌ Symbol {SYMBOL} not found")
-        mt5.shutdown()
-        return False
-    
-    if not symbol_info.visible:
-        if not mt5.symbol_select(SYMBOL, True):
-            print(f"❌ Failed to select {SYMBOL}")
+        # Try to find a broker-specific variant
+        candidates = mt5.symbols_get(f"*{SYMBOL}*") or []
+        if candidates:
+            symbol_name = candidates[0].name
+            print(f"ℹ️  Using broker symbol variant: {symbol_name}")
+            symbol_info = mt5.symbol_info(symbol_name)
+        if symbol_info is None:
+            print(f"❌ Symbol {SYMBOL} not found (no broker variants matched)")
             mt5.shutdown()
             return False
     
-    print(f"✅ Symbol {SYMBOL} available:")
+    if not symbol_info.visible:
+        if not mt5.symbol_select(symbol_name, True):
+            print(f"❌ Failed to select {symbol_name}")
+            mt5.shutdown()
+            return False
+    
+    print(f"✅ Symbol {symbol_name} available:")
     print(f"   Bid: {symbol_info.bid:.5f}")
     print(f"   Ask: {symbol_info.ask:.5f}")
     print(f"   Spread: {symbol_info.spread} points")

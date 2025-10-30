@@ -1,4 +1,4 @@
-# FXIFY Trading Bot - Backtest Results Summary
+# FTMO Trading Bot - Backtest Results Summary
 
 ## Test Configuration
 
@@ -6,9 +6,9 @@
 - **Initial Capital**: $10,000
 - **Timeframe**: Daily (1D)
 - **Risk Per Trade**: 1% base, 2% on strong setups
-- **Max Daily Loss Limit**: 5% (FXIFY rule)
-- **Max Total Loss Limit**: 10% (FXIFY rule)
-- **Profit Target**: 8% (FXIFY challenge)
+- **Max Daily Loss Limit**: 5% (FTMO rule)
+- **Max Total Loss Limit**: 10% (FTMO rule)
+- **Profit Target**: 10% (FTMO Challenge Phase 1)
 
 ---
 
@@ -201,37 +201,34 @@ TRAIL_ATR_MULT=2.8
 
 ---
 
-## 15m Portfolio (XAUUSD, USDJPY, ETHUSD) — New Risk & Filters
+## 15m Portfolio (EURUSD, USDJPY) — FTMO mode on MT5 CSV
 
 - Run Date: 2025-10-28
-- Data Window: 2025-09-10 to 2025-10-28 (Yahoo intraday window; XAU via GC=F fallback)
+- Data Window: 2025-08-31 to 2025-10-28 (MT5 export, 15m)
 - Timeframe: 15m
-- Capital: $15,000
+- Capital: $100,000
 
 Settings
-- Risk per trade: 0.30% (–25% from prior 0.40%)
-- Max concurrent risk: 1.0%
-- Daily stop: −3.0% (block entries for rest of UTC day)
-- Stop/trailing: 2.4× ATR; break-even at +1R; trail from +1.5R; partial at +2R
+- FTMO rules: day reset Europe/Prague, daily −5% block, overall −10% liquidation
+- Risk per trade: 0.30%; Max concurrent risk: 1.0%
+- Stop/trailing: 2.4× ATR; BE at +1R; trail from +1.5R; partial at +2R
 - Sessions:
    - USDJPY: 00:00–06:00 & 12:00–16:00 UTC
-   - XAUUSD: 07:00–17:00 UTC
-   - ETHUSD: avoid Fri 22:00–Sun 22:00 UTC
-- Quality filters: ADX ≥ 25, ATR% symbol-normalized (USDJPY≈0.06%, XAU≈0.25%, ETH≈0.40%), min MA distance ≥ 10 bps
-- ML gating: Enabled for ETH only, threshold 0.28; off for USDJPY/XAUUSD
-- News blackout: Optional ±10 min for USD/JPY/XAU (CSV not provided in this run)
+   - EURUSD: default window (06:00–15:00 UTC)
+- Quality: ADX ≥ 25, ATR% normalized (USDJPY≈0.06%, EURUSD≈0.04%), min MA distance ≥ 10 bps
+- Data source: MT5 CSVs (EURUSD.sim, USDJPY.sim)
 
 Results (Portfolio)
-- Return: +4.92%
-- Max Drawdown: −2.27%
-- Sharpe: 4.25
-- Trades: 23
-- Win Rate: 60.9%
-- Profit Factor: 1.92
+- Return: +5.04%
+- Max Drawdown: −3.60%
+- Sharpe: 3.64
+- Trades: 32
+- Win Rate: 53.1%
+- Profit Factor: 1.45
 
 Notes
-- XAUUSD spot (XAUUSD=X) intermittently failed from Yahoo; used GC=F fallback (COMEX gold futures) for timely 15m data.
-- ETH ML gate at 0.28 improved quality in prior trials; we’ll keep USDJPY/XAU ungated until more samples accumulate.
+- Broker symbols used: EURUSD.sim, USDJPY.sim (auto-resolved in exporter)
+- ML gating disabled for these runs; can be enabled per symbol if desired
 
 ### Micro‑pyramiding impact (+0.2% steps, max +0.6%/symbol)
 
@@ -311,6 +308,60 @@ Based on backtests with FXIFY rules:
 **Total**: 4-7 months to pass both phases with this strategy.
 
 ---
+
+## 15m Portfolio — Improved settings (filters tightened, ETH ML, pyramiding)
+
+- Run Date: 2025-10-28
+- Data Window: 2025-09-01 to 2025-10-28 (Yahoo 15m; XAU via GC=F fallback)
+- Timeframe: 15m
+- Capital: $15,000
+
+Common Settings
+- Risk per trade: 0.30%
+- Max concurrent risk: 1.0%
+- Daily stop: −3.0%
+- Stop/trailing: 2.5× ATR; BE at +1R; trail from +1.5R; partial at +2R
+- Sessions as above; ATR% symbol-normalized as above
+- Quality filters tightened: ADX ≥ 27, min MA distance ≥ 12 bps
+- ML gating: Enabled for ETH only, threshold 0.28 (model: `ml/models/mlp_thr005.pkl`)
+
+Variant A — pyramiding step 0.12%, cap 0.60%
+- Flags: `--pyramid-enable --pyramid-step-risk 0.0012 --pyramid-max-total-risk 0.006 --adx-threshold 27 --min-ma-dist-bps 12 --ml-enable --ml-model ml/models/mlp_thr005.pkl --ml-eth-threshold 0.28`
+- Result:
+   - Return: +11.28%
+   - Max Drawdown: −2.06%
+   - Sharpe: 5.28
+   - Trades: 74
+   - Win Rate: 17.6%
+   - Profit Factor: 3.75
+
+Variant B — pyramiding step 0.10%, cap 0.60%
+- Flags: `--pyramid-enable --pyramid-step-risk 0.0010 --pyramid-max-total-risk 0.006 --adx-threshold 27 --min-ma-dist-bps 12 --ml-enable --ml-model ml/models/mlp_thr005.pkl --ml-eth-threshold 0.28`
+- Result:
+   - Return: +11.23%
+   - Max Drawdown: −2.06%
+   - Sharpe: 5.29
+   - Trades: 76
+   - Win Rate: 17.1%
+   - Profit Factor: 3.74
+
+Interpretation
+- Tightening ADX and MA-distance plus adding ETH-only ML gate significantly improved PF and Sharpe while reducing DD.
+- Pyramiding step size between 0.10% and 0.12% performed similarly; either is acceptable. Keep portfolio concurrent risk cap at 1.0%.
+- These settings are more aligned with prop-firm constraints (DD containment) while improving pace toward targets.
+
+### Walk-forward (two-week windows)
+
+Settings: Same as Variant A above (ETH ML 0.28, ADX≥27, MA≥12 bps, ATR=2.5, pyramiding step 0.12%, cap 0.60%).
+
+- W1 (2025-08-31 → 2025-09-12): Return +0.86%, MaxDD −1.24%, Sharpe 2.58, Trades 14, WinRate 14.3%, PF 2.01
+- W2 (2025-09-13 → 2025-09-27): Return +1.76%, MaxDD −0.83%, Sharpe 4.25, Trades 10, WinRate 20.0%, PF 4.34
+- W3 (2025-09-28 → 2025-10-12): Return +8.42%, MaxDD −1.34%, Sharpe 11.12, Trades 35, WinRate 14.3%, PF 84.59
+- W4 (2025-10-13 → 2025-10-27): Return +0.01%, MaxDD −0.95%, Sharpe 0.07, Trades 15, WinRate 26.7%, PF 1.25
+
+Notes
+- Data source is Yahoo 15m (XAU via GC=F fallback). Some windows show very few losses, inflating PF (e.g., W3) — consistent with strong trend segments.
+- Overall, DD stayed contained across windows; returns vary with trend quality. Performance remains within prop‑friendly drawdown limits.
 
 ## Next Steps
 

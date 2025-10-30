@@ -1,0 +1,2 @@
+# Improved config on unseen segment A (2025-09-01..2025-09-28)
+python backtests/fxify_phase1_backtest.py --symbols XAUUSD,USDJPY,ETHUSD --timeframe 15m --capital 100000 --risk-pct 0.003 --atr-mult 2.5 --adx-threshold 27 --min-ma-dist-bps 12 --start 2025-09-01 --sim-start 2025-09-01 --sim-end 2025-09-28 --ml-enable --ml-model ml/models/mlp_thr005.pkl --ml-eth-threshold 0.28 --pyramid-enable --pyramid-step-risk 0.0012 --pyramid-max-total-risk 0.006

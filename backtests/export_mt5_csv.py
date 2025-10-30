@@ -19,11 +19,17 @@ from pathlib import Path
 
 import pandas as pd
 
+from dotenv import load_dotenv
+
+# Robust import for MetaTrader5 module naming differences
 try:
-    import MetaTrader5 as mt5
-except Exception as e:
-    print("MetaTrader5 module not installed. Install with: pip install MetaTrader5")
-    sys.exit(1)
+    import MetaTrader5 as mt5  # type: ignore
+except Exception:
+    try:
+        import metatrader5 as mt5  # type: ignore
+    except Exception:
+        print("MetaTrader5/metatrader5 module not installed. Install with: pip install MetaTrader5")
+        sys.exit(1)
 
 # Timeframe mapping
 TF_MAP = {
@@ -38,6 +44,18 @@ TF_MAP = {
 
 
 def initialize(login: int|None, password: str|None, server: str|None, path: str|None) -> None:
+    # Load .env if present (supports .env.fxify too)
+    load_dotenv(dotenv_path=os.getenv('ENV_FILE', None) or '.env.fxify')
+    # Fill missing creds from env
+    if not login:
+        env_login = os.getenv('MT5_LOGIN', '')
+        login = int(env_login) if env_login.isdigit() else None
+    if not password:
+        password = os.getenv('MT5_PASSWORD', None)
+    if not server:
+        server = os.getenv('MT5_SERVER', None)
+    if not path:
+        path = os.getenv('MT5_PATH', None)
     if path:
         ok = mt5.initialize(path)
     else:
@@ -58,6 +76,27 @@ def export_symbol(symbol: str, tf_str: str, start: str, end: str, out_dir: Path)
 
     # Ensure symbol visible
     info = mt5.symbol_info(symbol)
+    if info is None:
+        # Try broker variants e.g. USDJPY.sim
+        variants = mt5.symbols_get(f"*{symbol}*") or []
+        for v in variants:
+            alt = v.name
+            print(f"Trying broker symbol variant for {symbol}: {alt}")
+            if mt5.symbol_select(alt, True):
+                symbol = alt
+                info = mt5.symbol_info(symbol)
+                break
+    else:
+        # If not visible or selection failed, also try variants
+        if not info.visible and not mt5.symbol_select(symbol, True):
+            variants = mt5.symbols_get(f"*{symbol}*") or []
+            for v in variants:
+                alt = v.name
+                print(f"Trying broker symbol variant for {symbol}: {alt}")
+                if mt5.symbol_select(alt, True):
+                    symbol = alt
+                    info = mt5.symbol_info(symbol)
+                    break
     if info is None or not info.visible:
         if not mt5.symbol_select(symbol, True):
             raise SystemExit(f"Symbol not available: {symbol}")
@@ -100,7 +139,12 @@ def main():
     ap.add_argument('--mt5-login', type=int, default=int(os.getenv('MT5_LOGIN', '0')))
     ap.add_argument('--mt5-password', default=os.getenv('MT5_PASSWORD', ''))
     ap.add_argument('--mt5-server', default=os.getenv('MT5_SERVER', ''))
+    ap.add_argument('--env-file', default=os.getenv('ENV_FILE', '.env.fxify'))
     args = ap.parse_args()
+
+    # Load env file if provided
+    if args.env_file and os.path.exists(args.env_file):
+        load_dotenv(args.env_file)
 
     login = args.mt5_login if args.mt5_login != 0 else None
     password = args.mt5_password or None
@@ -111,7 +155,8 @@ def main():
 
     out_dir = Path(args.out)
     for s in [x.strip() for x in args.symbols.split(',') if x.strip()]:
-        export_symbol(s.upper(), args.timeframe, args.start, args.end, out_dir)
+        # Do not change case; MT5 symbols can be case-sensitive (e.g., EURUSD.sim)
+        export_symbol(s, args.timeframe, args.start, args.end, out_dir)
 
     mt5.shutdown()
 
