@@ -1,132 +1,150 @@
-# General Trading Bot (FX, Gold, Crypto) – Backtesting + Live (MT5)
+# 15m FX Prop-Trading Bot (MT5) — Backtests + Live with FTMO/FXIFY Guardrails
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platform-Backtest%3A%20Win%2FLinux%20%7C%20Live%3A%20Windows-informational.svg)](#)
-[![Trading](https://img.shields.io/badge/domain-trading%2Fbacktesting-blue.svg)](#)
-[![MT5](https://img.shields.io/badge/execution-MetaTrader5-orange.svg)](#)
-[![Data](https://img.shields.io/badge/data-Yahoo%20Finance%20%2B%20CSV-yellowgreen.svg)](#)
+[![Platform](https://img.shields.io/badge/platform-Windows%20(MT5)-orange.svg)](#)
+[![Backtests](https://img.shields.io/badge/backtests-Python%2Fpandas-informational.svg)](#)
 
-High‑confidence 15m portfolio framework with session‑aware entries, tight risk controls, and optional ML gating. Backtests run on any OS; live execution mirrors the rules on Windows via MT5.
+Live MT5 bot and aligned backtester for 15‑minute FX trading, designed to comply with FTMO/FXIFY constraints. Includes session and spread‑aware entries, strict risk controls, mid‑bar management, and resilient broker‑state reconciliation.
 
 Highlights
-- Low drawdown profile: per‑trade risk 0.25–0.30%, 1.0% max concurrent, −3% daily stop
-- Quality filters that reduce chop (ADX, ATR% by symbol, min MA distance)
-- Cleaner exits: break‑even at +1R, ATR trail from +1.5R, partials at +2R; optional micro‑pyramiding to compound winners
-- Works out‑of‑the‑box for XAUUSD, USDJPY, ETHUSD; easy to extend to other assets/timeframes
+- FTMO/FXIFY guardrails: daily stop, total loss cap, Prague day reset, compliance checks before any trade
+- Quality gates: ADX, ATR% band, minimum MA distance with adaptive off‑hours floor, spread caps + percentiles
+- Risk‑based sizing with stage‑2 adds and pyramiding, margin‑aware preflight, and JPY per‑order lot caps
+- Mid‑bar heartbeat for trims/BE/trailing with a one‑trim‑per‑bar guard; clear, concise logs and CSV outputs
 
-Production‑ready backtesting and live‑trading framework focused on robust risk controls, session‑aware entries, and optional ML gating. Works out‑of‑the‑box for USDJPY, XAUUSD (Gold), ETHUSD on 15m; easily adaptable to other assets/timeframes.
+Pairs: optimized for EURUSD and USDJPY on 15m; extendable to others.
 
-## Features
+> Looking for a step‑by‑step? See QUICKSTART: `QUICKSTART_FXIFY.md`.
 
-- Multi‑asset, multi‑timeframe backtests with portfolio risk caps and daily stop
-- Indicator edge (EMA 50/200, ADX, ATR, RSI) with quality filters (ADX, ATR%, MA distance)
-- Session‑aware entries (symbol‑specific windows) and Tier‑1 news blackout (optional)
-- Risk management: per‑trade risk %, max concurrent risk %, hard daily stop
-- Exits: break‑even at +1R, trailing from +1.5R (ATR‑based), partial at +2R
-- Optional micro‑pyramiding after +1R in small risk steps with per‑symbol caps
-- Light ML gating (ETH enabled by default) using provided model interface
-- Live trading via MetaTrader 5 (MT5) with the same guardrails
-
-## Quickstart
-
-1) Create and activate a Python 3.10+ virtual environment.
-2) Install dependencies:
-
-```
-pip install -r requirements.txt
-```
-
-3) Backtest a 3‑asset 15m portfolio (uses Yahoo for FX/crypto; GC=F fallback for gold):
-
-```
-python backtests\fxify_phase1_backtest.py --symbols XAUUSD,USDJPY,ETHUSD --timeframe 15m --capital 15000 --risk-pct 0.003 --ml-enable --ml-eth-threshold 0.28 --start 2025-09-10
-```
-
-Notes:
-- Yahoo intraday history is ~60 days. For longer windows, export CSVs from MT5: `backtests/export_mt5_csv.py`.
-- Results and per‑asset CSVs are written under `backtests/reports/`.
-
-## Live trading (MT5)
-
-Live trading uses `live/trading_bot_fxify.py` and requires MetaTrader 5 installed and a funded/login account configured. Set environment variables (use `.env`):
-
-```
-MT5_LOGIN=...
-MT5_PASSWORD=...
-MT5_SERVER=...
-SYMBOL=XAUUSD              # or USDJPY, ETHUSD
-TIMEFRAME=15Min
-RISK_PCT=0.003            # 0.3% per trade
-TRAIL_ATR_MULT=2.5        # suggested
-DAILY_STOP_PCT=0.03       # -3% daily stop
-
-# Optional ML gating (recommended for ETH)
-ML_ENABLE=true
-ML_MODEL_PATH=ml/models/mlp_model.pkl
-ML_PROB_THR=0.28
-```
-
-Run the bot:
-
-```
-python live\trading_bot_fxify.py
-```
-
-## Key configuration
-
-- Risk controls: `--risk-pct`, `--daily-stop-pct`, `--pyramid-*`, `--max-trades-per-day` (code default 6)
-- Quality filters: `--adx-threshold`, `--atr-pct-threshold`, `--min-ma-dist-bps`
-- Sessions and news: per‑symbol windows are built‑in; use `--news-calendar` CSV to blackout ±10min around Tier‑1 events
-- ML gating: `--ml-enable`, per‑symbol overrides `--ml-eth-threshold`, `--ml-usdjpy-enable`, `--ml-xauusd-enable`
-
-## Project layout
+## Repository structure
 
 ```
 backtests/
-  fxify_phase1_backtest.py       # 15m portfolio backtester with sessions, risk caps, ML gating
-  export_mt5_csv.py              # export 15m (or other) bars from MT5 to CSV
-  reports/                       # outputs and summaries
+  fxify_phase1_backtest.py      # 15m backtester mirroring live gates and FTMO/FXIFY constraints
+  reports/                      # CSV summaries and sweep results
 live/
-  trading_bot_fxify.py           # MT5 live bot with the same guardrails
-ml/
-  infer.py                       # model loading + predict_entry_prob interface
+  trading_bot_fxify.py          # MT5 live bot with spread/session gates and risk controls
+scripts/
+  run_ftmo_bot_eurusd.ps1       # PowerShell launchers with per‑symbol overrides
+  run_ftmo_bot_usdjpy.ps1
 strategy/
-  indicators.py, edge.py         # indicator suite and edge scoring
-
-## Alpaca (paper) mode
-
-If you’ve run a similar bot on Replit with Alpaca, see `docs/ALPACA_NOTES.md` for:
-- Quick setup (API keys, paper endpoint)
-- Known startup reconciliation fix (treat 404 "position does not exist" as no position)
-- Example logs and how to capture a result screenshot for your portfolio section
-
+  indicators.py, edge.py        # indicators + edge scoring utilities
+ml/                             # optional; not required for FX bots
 ```
 
-## Architecture
+## Requirements
 
-- Strategy: EMA(50/200), ATR(14), ADX(14), RSI(14), plus edge scoring from `strategy/edge.py`.
-- Backtester: Simulates per‑symbol positions, respects sessions/news, enforces risk limits, exits with BE/trailing/partials.
-- Live: Mirrors backtest logic, adds MT5 execution, spread checks, consistency with daily/total drawdown policies.
+- Windows with MetaTrader 5 installed and logged in
+- Python 3.10+
+- Packages: `pip install -r requirements.txt`
 
-## Example: symbol‑specific sessions
+## Live trading (MT5)
 
-- USDJPY: 00:00–06:00 and 12:00–16:00 UTC
-- XAUUSD: 07:00–17:00 UTC
-- ETHUSD: avoid Fri 22:00–Sun 22:00 UTC
+Recommended: start via the provided PowerShell scripts to pass per‑symbol overrides.
 
-## Results snapshot (15m, last ~6 weeks)
+USDJPY
+```powershell
+$env:ALWAYS_ACTIVE = "true"
+$env:ADX_THRESHOLD = "18"
+$env:MIN_MA_DIST_BPS = "1.5"
+$env:MAX_SPREAD_PIPS = "0.8"
+$env:MGMT_ENABLE = "true"
+$env:MGMT_HEARTBEAT_SEC = "5"
+powershell -ExecutionPolicy Bypass -File scripts\run_ftmo_bot_usdjpy.ps1
+```
 
-- Baseline (no pyramiding): Return +4.92%, MaxDD −2.27%, PF 1.92
-- With pyramiding (+0.2% steps, cap +0.6%/symbol): Return +9.33%, MaxDD −2.27%, PF 3.41
-- ATR_MULT sweep: 2.5 > 2.2 on PF and DD; ETH ML thr 0.25–0.30 neutral → default 0.28
+EURUSD
+```powershell
+$env:ALWAYS_ACTIVE = "true"
+$env:ADX_THRESHOLD = "22"
+$env:MIN_MA_DIST_BPS = "1.2"
+$env:MAX_SPREAD_PIPS = "0.5"
+$env:MGMT_ENABLE = "true"
+$env:MGMT_HEARTBEAT_SEC = "5"
+powershell -ExecutionPolicy Bypass -File scripts\run_ftmo_bot_eurusd.ps1
+```
 
-For detailed metrics, see `backtests/reports/BACKTEST_RESULTS_SUMMARY.md`.
+Notes
+- `ALWAYS_ACTIVE=true` bypasses off‑hours strict checks; the startup banner will indicate the bypass.
+- Mid‑bar management (`MGMT_ENABLE`) refreshes trims/BE/trailing every `MGMT_HEARTBEAT_SEC` seconds.
 
-## Resume snippet
+## Backtesting
 
-See `docs/RESUME_SNIPPET.md` for a copy‑paste friendly blurb highlighting design, technology, and impact.
+Run a 15m portfolio backtest aligned to live gates:
+
+```powershell
+python backtests\fxify_phase1_backtest.py `
+  --symbols EURUSD,USDJPY `
+  --timeframe 15m `
+  --capital 100000 `
+  --risk-pct 0.003 `
+  --start 2025-09-05 `
+  --always-active `
+  --adx-threshold 27 `
+  --min-ma-dist-bps 1.5 `
+  --atr-pct-min 0.04 `
+  --atr-pct-max 0.20 `
+  --offhours-strict-adx-min 28 `
+  --ma-norm-min-offhours 0.6 `
+  --adaptive-mabps-enable `
+  --adaptive-mabps-coeff 0.35 `
+  --adaptive-mabps-floor-bps 1.0 `
+  --day-reset-tz Europe/Prague `
+  --daily-stop-pct 0.05 `
+  --max-loss-pct 0.10
+```
+
+Outputs are written to `backtests/reports/` (portfolio and per‑asset summaries).
+
+## Configuration reference
+
+Entries and adds
+- ADX threshold: `ADX_THRESHOLD`
+- Min MA distance (bps): `MIN_MA_DIST_BPS`
+- ATR% band: `ATR_PCT_MIN`, `ATR_PCT_MAX` (backtests via flags)
+- Adaptive MA floor (off‑hours): `ADAPTIVE_MABPS_ENABLE`, `ADAPTIVE_MABPS_COEFF`, `ADAPTIVE_MABPS_FLOOR_BPS`
+- Spread caps and percentiles: `MAX_SPREAD_PIPS`; entries use p20; adds use up to p35 (equality allowed at cap)
+
+Risk and compliance
+- Risk per trade: backtests `--risk-pct`; live uses risk‑based sizing per stop distance
+- Daily stop and overall loss caps:
+  - Live: `FXIFY_MAX_DAILY_LOSS_PCT`, `FXIFY_MAX_TOTAL_LOSS_PCT` (defaults 0.05 and 0.10)
+  - Backtests: `--daily-stop-pct`, `--max-loss-pct`
+- Day reset timezone: `DAY_RESET_TZ` (e.g., `Europe/Prague`)
+
+Management
+- Mid‑bar management enable: `MGMT_ENABLE`
+- Heartbeat seconds: `MGMT_HEARTBEAT_SEC`
+- One‑trim‑per‑bar guard enforced automatically
+
+## How it works (brief)
+
+- Indicators: EMA(10/25/200), ADX(14), ATR(14), RSI(14)
+- Entry gates: trend and edge alignment, ATR% in band, MA distance with adaptive off‑hours floor, spread cap/percentile
+- Staging: stage‑2 add only if price breaks entry bar high/low, ADX now ≥ entry ADX, RSI filter, and spread within cap
+- Pyramiding: add sizing uses the same risk‑to‑lots calculator as entries; margin‑aware preflight steps down to fit; JPY per‑order caps
+- Defense: BE promotions and ATR trailing (spread‑aware), early adverse‑move trims, failed breakout and ADX floor exits, drawdown fuse
+- Heartbeat: mid‑bar loop updates trims and stops every few seconds while ensuring no more than one trim per bar
+
+## Logs and state
+
+- Logs: `logs/` folder; look for startup banner, gate decisions, adds, trims, BE/trail, and margin step‑downs
+- State: `ftmo_bot_state.json` and per‑symbol variants (e.g., `ftmo_bot_state_usdjpy.json`)
+- CSV outputs: `backtests/reports/*`
+
+## Troubleshooting
+
+- MT5 initialize/login issues: ensure MT5 is running and logged in; if needed, set `MT5_PATH` in your env
+- "TRADE_RETCODE_NO_MONEY": live bot auto‑reduces add size via margin preflight; reduce risk or widen stop if persistent
+- Partial‑close errors (10038): volumes are auto‑floored to the symbol’s step and re‑tried with step‑down
+- Spreads too high: tighten `MAX_SPREAD_PIPS` and/or wait for liquid sessions; entries use p20, adds allow equality at cap
 
 ## License
 
 MIT — see `LICENSE`.
+
+## Related docs
+
+- Quick start: `QUICKSTART_FXIFY.md`
+- FXIFY‑oriented readme (legacy): `README_FXIFY.md`
