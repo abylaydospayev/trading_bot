@@ -24,6 +24,25 @@ if (Test-Path $envFile) {
     }
 }
 
+# Optional aggressive preset
+if ($env:AGGRESSIVE -and $env:AGGRESSIVE.ToLower() -eq "true") {
+    $preset = "configs/live/presets/aggressive_usdjpy.env"
+    if (Test-Path $preset) {
+        Write-Host "AGGRESSIVE=true -> loading preset $preset"
+        Get-Content $preset | ForEach-Object {
+            if ($_ -match '^[#\s]') { return }
+            $parts = $_.Split('=', 2)
+            if ($parts.Length -eq 2) {
+                $name = $parts[0].Trim()
+                $value = $parts[1].Trim()
+                [Environment]::SetEnvironmentVariable($name, $value)
+            }
+        }
+    } else {
+        Write-Host "AGGRESSIVE preset not found at $preset"
+    }
+}
+
 # Overrides for USDJPY instance (process env)
 $env:SYMBOL = "USDJPY.sim"
 $env:MAGIC_NUMBER = "923451"
@@ -43,13 +62,13 @@ $env:ALWAYS_ACTIVE = "true"
 $env:OFFHOURS_ADX_MIN = "20"
 $env:OFFHOURS_SPREAD_EURUSD = "0.3"
 $env:OFFHOURS_SPREAD_JPY = "0.8"
-# Risk and pyramiding
-$env:RISK_PCT = "0.005"
-$env:RISK_PCT_BASE = "0.005"
-$env:RISK_PCT_STRONG = "0.005"
-$env:PYRAMID_ENABLE = "true"
-$env:PYRAMID_STEP_RISK = "0.0012"
-$env:PYRAMID_MAX_TOTAL_RISK = "0.006"
+# Risk and pyramiding (leave preset values if AGGRESSIVE=true)
+if (-not $env:RISK_PCT) { $env:RISK_PCT = "0.005" }
+if (-not $env:RISK_PCT_BASE) { $env:RISK_PCT_BASE = "0.005" }
+if (-not $env:RISK_PCT_STRONG) { $env:RISK_PCT_STRONG = "0.005" }
+if (-not $env:PYRAMID_ENABLE) { $env:PYRAMID_ENABLE = "true" }
+if (-not $env:PYRAMID_STEP_RISK) { $env:PYRAMID_STEP_RISK = "0.0012" }
+if (-not $env:PYRAMID_MAX_TOTAL_RISK) { $env:PYRAMID_MAX_TOTAL_RISK = "0.006" }
 
 Write-Host ("USDJPY overrides -> ADX_THRESHOLD={0}, MIN_MA_DIST_BPS={1}, MIN_EDGE_ATR_PCT={2}, MAX_SPREAD_PIPS={3}, ALWAYS_ACTIVE={4}, OFFHOURS_SPREAD_JPY={5}" -f $env:ADX_THRESHOLD, $env:MIN_MA_DIST_BPS, $env:MIN_EDGE_ATR_PCT, $env:MAX_SPREAD_PIPS, $env:ALWAYS_ACTIVE, $env:OFFHOURS_SPREAD_JPY)
 

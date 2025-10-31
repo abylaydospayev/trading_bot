@@ -9,6 +9,13 @@ try {
     $env:PYTHONIOENCODING = "utf-8"
 } catch {}
 
+# Disabled by default per user decision to run only USDJPY.
+# Set ENABLE_EURUSD=true in the environment to re-enable this launcher.
+if (-not $env:ENABLE_EURUSD -or $env:ENABLE_EURUSD.ToLower() -ne "true") {
+    Write-Host "EURUSD bot is disabled (run_ftmo_bot_eurusd.ps1). Set ENABLE_EURUSD=true to re-enable." -ForegroundColor Yellow
+    exit 0
+}
+
 # Load base FTMO env
 $envFile = "configs/live/mt5_ftmo.env"
 if (Test-Path $envFile) {
@@ -21,6 +28,25 @@ if (Test-Path $envFile) {
             $value = $parts[1].Trim()
             [Environment]::SetEnvironmentVariable($name, $value)
         }
+    }
+}
+
+# Optional aggressive preset
+if ($env:AGGRESSIVE -and $env:AGGRESSIVE.ToLower() -eq "true") {
+    $preset = "configs/live/presets/aggressive_eurusd.env"
+    if (Test-Path $preset) {
+        Write-Host "AGGRESSIVE=true -> loading preset $preset"
+        Get-Content $preset | ForEach-Object {
+            if ($_ -match '^[#\s]') { return }
+            $parts = $_.Split('=', 2)
+            if ($parts.Length -eq 2) {
+                $name = $parts[0].Trim()
+                $value = $parts[1].Trim()
+                [Environment]::SetEnvironmentVariable($name, $value)
+            }
+        }
+    } else {
+        Write-Host "AGGRESSIVE preset not found at $preset"
     }
 }
 
@@ -59,9 +85,9 @@ $env:PYRAMID_MAX_TOTAL_RISK = "0.006"
 $offEdge = if ($env:OFFHOURS_EDGE_BUY_SCORE) { $env:OFFHOURS_EDGE_BUY_SCORE } else { "(default)" }
 Write-Host ("EURUSD overrides -> ADX_THRESHOLD={0}, MIN_MA_DIST_BPS={1}, MIN_EDGE_ATR_PCT={2}, MAX_SPREAD_PIPS={3}, ALWAYS_ACTIVE={4}, OFFHOURS_EDGE_BUY_SCORE={5}" -f $env:ADX_THRESHOLD, $env:MIN_MA_DIST_BPS, $env:MIN_EDGE_ATR_PCT, $env:MAX_SPREAD_PIPS, $env:ALWAYS_ACTIVE, $offEdge)
 
-# Risk per trade: 0.5%
-$env:RISK_PCT = "0.005"
-$env:RISK_PCT_BASE = "0.005"
-$env:RISK_PCT_STRONG = "0.005"
+# Risk per trade (leave preset values if AGGRESSIVE=true)
+if (-not $env:RISK_PCT) { $env:RISK_PCT = "0.005" }
+if (-not $env:RISK_PCT_BASE) { $env:RISK_PCT_BASE = "0.005" }
+if (-not $env:RISK_PCT_STRONG) { $env:RISK_PCT_STRONG = "0.005" }
 
 python live/trading_bot_ftmo.py

@@ -86,29 +86,83 @@ TRAIL_ABS_WIDEN_TO = 4.0
 MAX_TRADES_PER_DAY = 5
 MIN_COOLDOWN_BARS = 1  # Minimum bars between trades
 
-# Costs
-SPREAD_PIPS = 1.0  # Typical spread
-SLIPPAGE_PIPS = 0.5  # Slippage
+# Costs and slippage model
+SPREAD_PIPS = 1.0  # Typical spread (baseline)
+SLIPPAGE_PIPS = 0.5  # Legacy fixed slippage (used if DYNAMIC_SLIPPAGE=False)
+DYNAMIC_SLIPPAGE = True
+
+def _base_slippage_pips(symbol: str) -> float:
+    s = symbol.upper()
+    if s.startswith("EURUSD"):
+        return 0.2
+    if "JPY" in s:
+        return 0.3
+    if s.startswith("XAU") or "GOLD" in s:
+        return 0.8
+    return 0.25
+
+def _slip_scale(symbol: str) -> float:
+    s = symbol.upper()
+    if s.startswith("EURUSD"):
+        return 2.0
+    if "JPY" in s:
+        return 2.5
+    if s.startswith("XAU") or "GOLD" in s:
+        return 8.0
+    return 2.0
+
+def compute_slippage_pips(symbol: str, atr_pct: float, spread_pips: float = SPREAD_PIPS) -> float:
+    """Volatility-adaptive slippage in pips.
+
+    atr_pct is in percent (e.g., 0.06 means 0.06%).
+    Model: base + scale * max(0, atr_pct - 0.05)
+    Capped to 0.9 * spread to avoid pathological over-slippage.
+    """
+    try:
+        base = _base_slippage_pips(symbol)
+        scale = _slip_scale(symbol)
+        vol_excess = max(0.0, float(atr_pct) - 0.05)
+        slip = base + scale * vol_excess
+        cap = max(0.1, 0.9 * float(spread_pips))
+        return float(min(slip, cap))
+    except Exception:
+        return float(SLIPPAGE_PIPS)
 
 EPS = 1e-12
 
 # ===================== DATA UTILITIES =====================
 
 def download_forex(symbol: str, start: str, interval: str) -> pd.DataFrame:
-    """Download forex data from yfinance"""
+    """Download forex data from yfinance with simple fallbacks for metals."""
     print(f"Downloading {symbol} from {start} ({interval})...")
-    
-    # Convert symbol format: EURUSD -> EUR=X or EURUSD=X
-    if "=" not in symbol and "/" not in symbol:
-        yf_symbol = f"{symbol}=X"
-    else:
-        yf_symbol = symbol
-    
-    df = yf.download(yf_symbol, start=start, interval=interval, progress=False, 
-                     auto_adjust=False, actions=False)
-    
+
+    # Primary mapping: spot FX style e.g., EURUSD -> EURUSD=X
+    def _primary(sym: str) -> str:
+        if "=" not in sym and "/" not in sym:
+            return f"{sym}=X"
+        return sym
+
+    candidates = []
+    base = symbol.upper()
+    candidates.append(_primary(base))
+    # Metals fallbacks: some environments fail on XAUUSD=X; try XAU=X (per-ounce USD index) and GC=F (COMEX gold futures)
+    if base.startswith("XAU") or "GOLD" in base:
+        for alt in ("XAU=X", "GC=F"):
+            if alt not in candidates:
+                candidates.append(alt)
+
+    last_err = None
+    for yf_symbol in candidates:
+        try:
+            df = yf.download(yf_symbol, start=start, interval=interval, progress=False, auto_adjust=False, actions=False)
+        except Exception as e:
+            last_err = e
+            df = None
+        if df is not None and not df.empty:
+            print(f"  Loaded from {yf_symbol}")
+            break
     if df is None or df.empty:
-        raise RuntimeError(f"No data for {symbol} {interval}")
+        raise RuntimeError(f"No data for {symbol} {interval} (tried {candidates}); last error: {last_err}")
     
     # Handle MultiIndex columns - yfinance can return (Price, Symbol) structure  
     if isinstance(df.columns, pd.MultiIndex):
@@ -228,7 +282,6 @@ def backtest_fxify(
     df = compute_indicators(bars)
     pip_value = get_pip_value(symbol)
     spread_cost = SPREAD_PIPS * pip_value
-    slippage_cost = SLIPPAGE_PIPS * pip_value
     
     # State
     equity = initial_capital
@@ -280,7 +333,12 @@ def backtest_fxify(
         if daily_loss_pct >= FXIFY_MAX_DAILY_LOSS_PCT:
             if position:
                 # Force close position
-                exit_price = price - spread_cost
+                if DYNAMIC_SLIPPAGE:
+                    slip_pips = compute_slippage_pips(symbol, float(row.get("atr_pct", 0.05)))
+                else:
+                    slip_pips = SLIPPAGE_PIPS
+                slippage_cost = slip_pips * pip_value
+                exit_price = price - spread_cost - slippage_cost
                 pnl = (exit_price - position.entry_price) * position.position_size * 100000
                 equity += pnl
                 position.exit_time = row.name
@@ -299,7 +357,12 @@ def backtest_fxify(
         if total_loss_pct >= FXIFY_MAX_TOTAL_LOSS_PCT:
             if position:
                 # Force close
-                exit_price = price - spread_cost
+                if DYNAMIC_SLIPPAGE:
+                    slip_pips = compute_slippage_pips(symbol, float(row.get("atr_pct", 0.05)))
+                else:
+                    slip_pips = SLIPPAGE_PIPS
+                slippage_cost = slip_pips * pip_value
+                exit_price = price - spread_cost - slippage_cost
                 pnl = (exit_price - position.entry_price) * position.position_size * 100000
                 equity += pnl
                 position.exit_time = row.name
@@ -352,6 +415,11 @@ def backtest_fxify(
             
             # Exit logic
             if stop_hit or edge_exit:
+                if DYNAMIC_SLIPPAGE:
+                    slip_pips = compute_slippage_pips(symbol, float(row.get("atr_pct", 0.05)))
+                else:
+                    slip_pips = SLIPPAGE_PIPS
+                slippage_cost = slip_pips * pip_value
                 exit_price = price - spread_cost - slippage_cost
                 pnl = (exit_price - position.entry_price) * position.position_size * 100000
                 equity += pnl
@@ -415,6 +483,11 @@ def backtest_fxify(
                     risk_pct = RISK_PCT_STRONG
                 
                 # Calculate lot size
+                if DYNAMIC_SLIPPAGE:
+                    slip_pips = compute_slippage_pips(symbol, float(row.get("atr_pct", 0.05)))
+                else:
+                    slip_pips = SLIPPAGE_PIPS
+                slippage_cost = slip_pips * pip_value
                 entry_price = price + spread_cost + slippage_cost
                 risk_dollars = equity * risk_pct
                 stop_distance = P["trailing_stop_atr_mult"] * atr

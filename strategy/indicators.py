@@ -56,3 +56,24 @@ def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     avg_loss = _wilder_ewm(loss, period).replace(0, EPS)
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
+
+
+def calculate_macd(
+    close: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD indicator.
+
+    Returns (macd, signal_line, histogram) where:
+    - macd = EMA(fast) - EMA(slow)
+    - signal_line = EMA(macd, signal)
+    - histogram = macd - signal_line
+    """
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = (ema_fast - ema_slow).fillna(0.0)
+    signal_line = macd.ewm(span=signal, adjust=False).mean().fillna(0.0)
+    hist = (macd - signal_line).fillna(0.0)
+    return macd, signal_line, hist

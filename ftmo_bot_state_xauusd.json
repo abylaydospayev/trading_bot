@@ -12,16 +12,12 @@
   "edge_exit_streak": 0,
   "last_trade_ts": null,
   "trades_today": 0,
-  "trades_day_str": "2025-10-30T23:00:04.843736+00:00",
+  "trades_day_str": "2025-10-30T23:31:35.281542+00:00",
   "loss_streak": 0,
   "circuit_breaker_until": null,
   "last_stop_price": null,
-  "initial_balance": 100000.0,
+  "initial_balance": 98972.55,
   "day_start_equity": 98972.55,
-  "high_water_mark": 100000.0,
-  "total_profit": 0.0,
-  "eurusd_confirm_buf": [
-    false,
-    false
-  ]
+  "high_water_mark": 98972.55,
+  "total_profit": 0.0
 }

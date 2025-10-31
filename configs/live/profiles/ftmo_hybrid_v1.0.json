@@ -1,0 +1,104 @@
+{
+  "profile_name": "FTMO_Hybrid_v1.0",
+  "mode": "multi_pair",
+  "global": {
+    "risk_limit_daily": 5.0,
+    "risk_limit_total": 10.0,
+    "max_concurrent_risk": 1.2,
+    "always_active": false,
+    "auto_equity_guard": true,
+    "equity_guard_dd": -4.0,
+    "circuit_breaker_loss_streak": 3,
+    "session_window_utc": "06-16",
+    "logging_level": "INFO"
+  },
+  "pairs": {
+    "GBPUSD": {
+      "weight": 0.30,
+      "risk_per_trade": 0.0038,
+      "timeframe": "1h",
+      "adx_threshold": 27,
+      "min_ma_bps": 2.0,
+      "min_edge_atr_pct": 0.02,
+      "max_spread_pips": 1.5,
+      "mr_z_entry": 0.8,
+      "edge_buy_score": 65,
+      "edge_confirm_bars": 2,
+      "scalp_module": { "enabled": false }
+    },
+    "USDJPY": {
+      "weight": 0.50,
+      "risk_per_trade": 0.005,
+      "timeframe": "15m",
+      "adx_threshold": 18,
+      "min_ma_bps": 1.5,
+      "min_edge_atr_pct": 0.02,
+      "max_spread_pips": 0.8,
+      "scalp_mode": true,
+      "scalp_module": {
+        "enabled": true,
+        "timeframe": "5m",
+        "entry_logic": "RSI+MACD",
+        "rsi_entry_long": 35,
+        "rsi_exit_long": 60,
+        "rsi_entry_short": 65,
+        "rsi_exit_short": 40,
+        "macd_signal_cross": true,
+        "tp_pips": 10,
+        "sl_pips": 15,
+        "risk_per_trade": 0.002,
+        "session_filter": "Asia+London"
+      }
+    },
+    "XAUUSD": {
+      "mt5_symbol": "XAUUSD",
+      "weight": 0.30,
+      "risk_per_trade": 0.0038,
+      "timeframe": "15m",
+      "adx_threshold": 22,
+      "min_ma_bps": 2.0,
+      "min_edge_atr_pct": 0.04,
+      "max_spread_pips": 2.0,
+      "scalp_module": {
+        "enabled": true,
+        "timeframe": "1m",
+        "entry_logic": "RSI+Momentum",
+        "rsi_entry_long": 30,
+        "rsi_exit_long": 55,
+        "rsi_entry_short": 70,
+        "rsi_exit_short": 45,
+        "momentum_threshold": 0.2,
+        "tp_pips": 25,
+        "sl_pips": 18,
+        "risk_per_trade": 0.0015,
+        "session_filter": "London+NY"
+      }
+    },
+    "EURUSD": {
+      "weight": 0.20,
+      "risk_per_trade": 0.0038,
+      "timeframe": "1h",
+      "adx_threshold": 22,
+      "min_ma_bps": 2.0,
+      "min_edge_atr_pct": 0.02,
+      "max_spread_pips": 0.35,
+      "mr_z_entry": 0.8,
+      "edge_buy_score": 50,
+      "edge_confirm_bars": 2,
+      "scalp_module": { "enabled": false }
+    }
+  },
+  "exit_logic": {
+    "trail_active": true,
+    "trail_factor": 0.7,
+    "trail_trigger_rr": 1.2,
+    "rsi_reversal_exit": 15,
+    "max_hold_minutes": 180,
+    "close_daily_gain_percent": 1.0
+  },
+  "allocation_logic": {
+    "rebalancing": "daily",
+    "correlation_guard": true,
+    "max_total_open_trades": 3
+  }
+}

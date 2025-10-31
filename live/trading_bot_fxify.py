@@ -50,6 +50,9 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from strategy.indicators import compute_atr_wilder, calculate_adx, calculate_rsi, MIN_ATR
+from signals.mr_engine import MREngineParams, compute_signal as mr_compute_signal
+from risk.sizer_sigma import sigma_to_stop_pips
+from strategy.scalp import ScalpParams, rsi_macd_signal, rsi_momentum_signal
 from strategy.edge import compute_edge_features_and_score, EdgeResult
 from ml.infer import predict_entry_prob
 
@@ -93,6 +96,21 @@ def _seconds_per_bar(tf_str: str) -> int:
     return mapping.get(tf_str, 15 * 60)
 
 SECONDS_PER_BAR = _seconds_per_bar(TIMEFRAME_STR)
+
+# --- Engine selection ---
+ENGINE = os.getenv("ENGINE", "TREND").upper()  # TREND | MR_SIGMA_ONLY
+
+# --- MR (Mean-Reversion sigma) params ---
+MR_MODE = os.getenv("MR_MODE", "ewma").lower()  # ewma|rolling
+MR_SPAN_MEAN = int(os.getenv("MR_SPAN_MEAN", "60"))
+MR_SPAN_STD = int(os.getenv("MR_SPAN_STD", "60"))
+MR_LOOKBACK = int(os.getenv("MR_LOOKBACK", "200"))
+MR_Z_ENTRY = float(os.getenv("MR_Z_ENTRY", "1.2"))
+MR_Z_EXIT = float(os.getenv("MR_Z_EXIT", "0.3"))
+MR_TIME_STOP_BARS = int(os.getenv("MR_TIME_STOP_BARS", "8"))
+MR_ADX_MAX = float(os.getenv("MR_ADX_MAX", "24"))
+MR_K_SIGMA_STOP = float(os.getenv("MR_K_SIGMA_STOP", "1.0"))
+MR_RISK_PCT = float(os.getenv("MR_RISK_PCT", os.getenv("RISK_PCT", "0.0038")))
 
 # --- FXIFY Risk Parameters ---
 # FXIFY rules: typically 5% max daily loss, 10% max total loss
@@ -219,6 +237,43 @@ MA_NORM_MIN_OFFHOURS = float(os.getenv("MA_NORM_MIN_OFFHOURS", "0.6"))
 OFFHOURS_STRICT_ADX_MIN = float(os.getenv("OFFHOURS_STRICT_ADX_MIN", "28"))
 OFFHOURS_STRICT_MA_NORM = float(os.getenv("OFFHOURS_STRICT_MA_NORM", "0.8"))
 
+# === Volatility brain helpers (quick wins) ===
+def realized_sigma(series: pd.Series, lookback: int = 60) -> float:
+    try:
+        s = pd.Series(series).astype(float)
+        if len(s) < max(10, lookback):
+            return 0.0
+        rets = np.diff(np.log(s.values))
+        if len(rets) <= 0:
+            return 0.0
+        return float(np.std(rets[-lookback:]))
+    except Exception:
+        return 0.0
+
+def sigma_to_pips_realized(symbol: str, sigma_bar: float, price_now: float) -> float:
+    pip = get_pip_value(symbol, mt5.symbol_info(symbol) or None)
+    try:
+        return (price_now * float(sigma_bar)) / max(pip, EPS)
+    except Exception:
+        return 0.0
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(v, hi))
+
+def dynamic_sl_tp(atr_pips: float, sigma_bar_pips: float, k_sl: float = 1.2, k_tp: float = 1.8) -> Tuple[float, float]:
+    sl = clamp(k_sl * sigma_bar_pips, 0.6 * atr_pips, 2.2 * atr_pips)
+    tp = clamp(k_tp * sigma_bar_pips, 0.8 * atr_pips, 3.0 * atr_pips)
+    return sl, tp
+
+def scaled_risk(base_risk: float, sigma_bar: float, sigma_target: float) -> float:
+    try:
+        if sigma_bar <= 0 or sigma_target <= 0:
+            return base_risk
+        mult = float(np.clip(float(sigma_target) / float(sigma_bar), 0.6, 1.4))
+        return base_risk * mult
+    except Exception:
+        return base_risk
+
 # --- Entry sizing and staging ---
 FIRST_ENTRY_PCT = float(os.getenv("FIRST_ENTRY_PCT", "0.65"))
 STAGE2_ENTRY_PCT = float(os.getenv("STAGE2_ENTRY_PCT", "0.35"))
@@ -246,6 +301,25 @@ FAILED_BREAKOUT_RSI = float(os.getenv("FAILED_BREAKOUT_RSI", "52.0"))
 # --- Mid-bar management (heartbeat) ---
 MGMT_ENABLE = os.getenv("MGMT_ENABLE", "true").lower() == "true"
 MGMT_HEARTBEAT_SEC = int(os.getenv("MGMT_HEARTBEAT_SEC", "5"))
+
+# --- Scalper (micro-edge) module ---
+SCALP_ENABLE = os.getenv("SCALP_ENABLE", "false").lower() == "true"
+SCALP_TF_STR = os.getenv("SCALP_TF", "5Min")  # 1Min or 5Min
+SCALP_TF = TIMEFRAME_MAP.get(SCALP_TF_STR, mt5.TIMEFRAME_M5)
+SCALP_ENTRY_LOGIC = os.getenv("SCALP_ENTRY_LOGIC", "RSI+MACD")  # or "RSI+Momentum"
+SCALP_RISK_PCT = float(os.getenv("SCALP_RISK_PCT", "0.0015"))
+SCALP_RSI_ENTRY_LONG = int(os.getenv("SCALP_RSI_ENTRY_LONG", "35"))
+SCALP_RSI_EXIT_LONG = int(os.getenv("SCALP_RSI_EXIT_LONG", "60"))
+SCALP_RSI_ENTRY_SHORT = int(os.getenv("SCALP_RSI_ENTRY_SHORT", "65"))
+SCALP_RSI_EXIT_SHORT = int(os.getenv("SCALP_RSI_EXIT_SHORT", "40"))
+SCALP_MACD_SIGNAL_CROSS = os.getenv("SCALP_MACD_SIGNAL_CROSS", "true").lower() == "true"
+SCALP_MOMENTUM_THRESHOLD = float(os.getenv("SCALP_MOMENTUM_THRESHOLD", "0.2"))
+SCALP_TP_PIPS = float(os.getenv("SCALP_TP_PIPS", "10"))
+SCALP_SL_PIPS = float(os.getenv("SCALP_SL_PIPS", "15"))
+SCALP_SESSION_FILTER = os.getenv("SCALP_SESSION_FILTER", "")
+SCALP_COOLDOWN_SEC = int(os.getenv("SCALP_COOLDOWN_SEC", "120"))
+SCALP_SPREAD_CAP_MULT = float(os.getenv("SCALP_SPREAD_CAP_MULT", "1.0"))  # fraction of MAX_SPREAD_PIPS
+MAGIC_NUMBER_SCALP = int(os.getenv("MAGIC_NUMBER_SCALP", str(int(os.getenv("MAGIC_NUMBER", "234567")) + 1000)))
 
 # ===================== LOGGING =====================
 
@@ -310,6 +384,26 @@ def get_default_state() -> dict:
         "day_start_equity": None,
         "high_water_mark": None,
         "total_profit": 0.0,
+        # Scalper state
+        "scalp_in_position": False,
+        "scalp_ticket": None,
+        "scalp_qty": 0.0,
+        "scalp_entry_price": 0.0,
+    "scalp_entry_time": None,
+    "scalp_loss_streak": 0,
+    "scalp_cooldown_until": None,
+        "scalp_last_check_ts": None,
+        # Regime controller
+        "regime": "R0",  # R0=FLAT, R1=TREND, R2=MR, R3=SCALP
+        "regime_cooldown_bars": 0,
+        "_last_bar_key_15m": None,
+        "_last_bar_key_m1": None,
+        "r1_bars_in": 0,
+        "r2_bars_in": 0,
+        "r1_fail_streak": 0,
+        "last_sigma_ewm_15m": None,
+        # Equity guard v2
+        "equity_guard_until": None,
     }
 
 def load_state() -> dict:
@@ -401,6 +495,88 @@ def _is_active_hour_utc(ts: Optional[datetime] = None, symbol: Optional[str] = N
         return True
     return ACTIVE_HOUR_START <= h <= ACTIVE_HOUR_END
 
+# ===== Volatility and caps helpers =====
+def _bars_per_year(tf_str: str) -> int:
+    # Approx for FX: 252 trading days
+    if tf_str == "1Min":
+        return 252 * 24 * 60
+    if tf_str == "5Min":
+        return 252 * 24 * 12
+    if tf_str == "15Min":
+        return 252 * 24 * 4
+    if tf_str == "1H":
+        return 252 * 24
+    if tf_str == "4H":
+        return 252 * 6
+    if tf_str == "1D":
+        return 252
+    return 252 * 24 * 4
+
+def annualize_sigma_percent(sigma_price: float, price_now: float, tf_str: str) -> float:
+    try:
+        if not sigma_price or not price_now or sigma_price <= 0 or price_now <= 0:
+            return 0.0
+        n = _bars_per_year(tf_str)
+        return (sigma_price / price_now) * 100.0 * math.sqrt(n)
+    except Exception:
+        return 0.0
+
+def _pair_vol_floor_percent(symbol: str) -> float:
+    up = symbol.upper()
+    if up.startswith("EURUSD"):
+        return 0.03
+    if "JPY" in up:
+        return 0.02
+    if up.startswith("XAU"):
+        return 0.04
+    return 0.03
+
+def _pair_spread_hard_cap(symbol: str) -> float:
+    up = symbol.upper()
+    if up.startswith("EURUSD"):
+        return 0.35
+    if up.endswith("JPY") or "JPY" in up:
+        return 0.8
+    if up.startswith("XAU"):
+        return 2.0
+    return MAX_SPREAD_PIPS
+
+def _scalp_spread_hard_cap(symbol: str) -> float:
+    up = symbol.upper()
+    if up.startswith("EURUSD"):
+        return 0.25
+    if up.endswith("JPY") or "JPY" in up:
+        return 0.6
+    if up.startswith("XAU"):
+        return 1.5
+    return MAX_SPREAD_PIPS
+
+def _scalp_sigma_band_percent(symbol: str) -> Tuple[float, float]:
+    up = symbol.upper()
+    if up.startswith("EURUSD"):
+        return (0.04, 0.20)
+    if up.endswith("JPY") or "JPY" in up:
+        return (0.03, 0.18)
+    if up.startswith("XAU"):
+        return (0.06, 0.35)
+    return (0.04, 0.20)
+
+def _compute_sigma_ann_percent_for_tf(symbol: str, timeframe: int, tf_str: str, span: int = 60) -> float:
+    try:
+        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, max(120, span * 3))
+        if rates is None or len(rates) == 0:
+            return 0.0
+        df = pd.DataFrame(rates)
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+        df.set_index('time', inplace=True)
+        prices = df['close'].astype(float)
+        ew_std = prices.ewm(span=max(5, span), adjust=False).std(bias=False)
+        sigma = float(ew_std.iloc[-1]) if float(ew_std.iloc[-1]) > 0 else 0.0
+        price_now = float(prices.iloc[-1])
+        return annualize_sigma_percent(sigma, price_now, tf_str)
+    except Exception:
+        return 0.0
+
 # ===================== MT5 UTILITIES =====================
 
 def initialize_mt5() -> bool:
@@ -430,13 +606,65 @@ def get_symbol_info(symbol: str) -> Optional[mt5.SymbolInfo]:
     """Get symbol information"""
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
-        # Try to find a broker variant (e.g., USDJPY.sim)
-        variants = mt5.symbols_get(f"*{symbol}*") or []
-        if variants:
-            alt = variants[0].name
-            logger.info(f"Using broker symbol variant: {alt}")
-            symbol = alt
-            symbol_info = mt5.symbol_info(symbol)
+        # Try base without suffix (e.g., XAUUSD.sim -> XAUUSD)
+        base = symbol.split('.')[0]
+        if base != symbol:
+            si_base = mt5.symbol_info(base)
+            if si_base is not None:
+                symbol = base
+                symbol_info = si_base
+        # Try to find a broker variant by wildcard using the base token
+        if symbol_info is None:
+            token = base
+            variants = mt5.symbols_get(f"{token}*") or []
+            if not variants:
+                variants = mt5.symbols_get(f"*{token}*") or []
+            if variants:
+                # Prefer exact token match if present
+                alt = None
+                for v in variants:
+                    if v.name.upper().startswith(token.upper()):
+                        alt = v.name
+                        break
+                if alt is None:
+                    alt = variants[0].name
+                logger.info(f"Using broker symbol variant: {alt}")
+                symbol = alt
+                symbol_info = mt5.symbol_info(symbol)
+            # Fallback heuristics for metals: prefer spot (XAUUSD/GOLD) over futures (e.g., XAUZ25)
+            if symbol_info is None and ("XAU" in token.upper() or "GOLD" in token.upper()):
+                try:
+                    candidates = list(mt5.symbols_get("*XAU*") or [])
+                    if not candidates:
+                        candidates = list(mt5.symbols_get("*GOLD*") or [])
+                    # Rank candidates: prefer explicit XAUUSD or GOLD cash, avoid month-coded futures
+                    def is_futures(name: str) -> bool:
+                        # Common month code letters: F G H J K M N Q U V X Z + two digits, e.g., XAUZ25, GCZ5
+                        import re
+                        return bool(re.search(r"(XAU|GC)[FGHJKMNQUVXZ]\d{1,2}", name.upper()))
+                    def score(name: str) -> tuple:
+                        up = name.upper()
+                        # High preference if it starts with XAUUSD or is exactly GOLD/GOLDUSD
+                        starts_xauusd = up.startswith("XAUUSD")
+                        has_usd = "USD" in up
+                        is_gold_cash = up == "GOLD" or up.startswith("GOLD.") or up.startswith("GOLDUSD")
+                        futures = is_futures(name)
+                        # Lower score is better
+                        return (
+                            0 if starts_xauusd else (1 if is_gold_cash else (2 if has_usd else 3)),
+                            1 if futures else 0,  # penalize futures
+                            len(name)  # shorter usually means spot vs. synthetic
+                        )
+                    if candidates:
+                        # Pick best-scoring non-futures preference
+                        best = sorted(candidates, key=lambda v: score(getattr(v, "name", "")))[0]
+                        alt = getattr(best, "name", None)
+                        if alt:
+                            logger.info(f"Using metals broker symbol variant: {alt}")
+                            symbol = alt
+                            symbol_info = mt5.symbol_info(symbol)
+                except Exception as _m:
+                    logger.debug(f"Metals variant resolution failed: {_m}")
         if symbol_info is None:
             logger.error(f"Symbol {symbol} not found")
             return None
@@ -643,6 +871,20 @@ def fetch_bars_and_indicators(symbol: str, timeframe: int, count: int = 500) -> 
         K = INDICATOR["adx_slope_lookback"]
         bars["adx_slope"] = bars["adx"] - bars["adx"].shift(K)
         
+        # MR support (EWMA stats for z-score)
+        try:
+            span_m = max(1, MR_SPAN_MEAN)
+            span_s = max(1, MR_SPAN_STD)
+            ew_mean = bars["close"].ewm(span=span_m, adjust=False).mean()
+            ew_std = bars["close"].ewm(span=span_s, adjust=False).std(bias=False)
+            bars["mr_ewm_mean"] = ew_mean
+            bars["mr_ewm_sigma"] = ew_std
+            bars["mr_z"] = (bars["close"] - ew_mean) / ew_std.replace({0.0: np.nan})
+        except Exception:
+            bars["mr_ewm_mean"] = np.nan
+            bars["mr_ewm_sigma"] = np.nan
+            bars["mr_z"] = 0.0
+        
         # ATR percentage
         bars["atr_pct"] = (bars["atr"] / bars["close"]).replace([np.inf, -np.inf], np.nan) * 100.0
         
@@ -680,6 +922,23 @@ def fetch_bars_and_indicators(symbol: str, timeframe: int, count: int = 500) -> 
         latest["prev_short_ma"] = prev["short_ma"]
         latest["vix_pct_change"] = 0.0  # No VIX for forex
         latest["bar_time"] = str(latest.name)
+        # Attach previous values used for 1-bar deltas and confirmations
+        try:
+            latest["prev_adx"] = float(prev["adx"])
+        except Exception:
+            latest["prev_adx"] = float(latest.get("adx", 0.0) or 0.0)
+        try:
+            latest["prev_rsi"] = float(prev["rsi"])
+        except Exception:
+            latest["prev_rsi"] = float(latest.get("rsi", 0.0) or 0.0)
+        try:
+            latest["prev_atr_pct"] = float(prev["atr_pct"])
+        except Exception:
+            latest["prev_atr_pct"] = float(latest.get("atr_pct", 0.0) or 0.0)
+        try:
+            latest["adx_delta_1"] = float(latest.get("adx", 0.0) or 0.0) - float(prev["adx"])  # 1-bar ΔADX
+        except Exception:
+            latest["adx_delta_1"] = 0.0
         
         # Compute edge score
         edge: EdgeResult = compute_edge_features_and_score(
@@ -746,6 +1005,8 @@ class FXIFYTradingBot:
         self.symbol_info = get_symbol_info(SYMBOL)
         if self.symbol_info is None:
             raise RuntimeError(f"Symbol {SYMBOL} not available")
+        # Update instance symbol in case a broker variant was resolved
+        self.symbol = SYMBOL
         
         self.state = load_state()
         self.account = mt5.account_info()
@@ -801,6 +1062,11 @@ class FXIFYTradingBot:
                 self.state["entry_atr"] = 0.0
                 self.state["trade_high_price"] = 0.0
                 self.state["trade_low_price"] = 0.0
+                # Block entries for one bar after state reset to avoid ghost re-entry
+                try:
+                    self.state["startup_block_until_bar"] = self._current_bar_key()
+                except Exception:
+                    self.state["startup_block_until_bar"] = None
                 save_state(self.state)
         except Exception as _e:
             logger.warning(f"Startup reconciliation skipped: {_e}")
@@ -819,9 +1085,16 @@ class FXIFYTradingBot:
                 logger.warning("Trading not allowed on this account (trade_allowed=false). Check account permissions and market hours.")
         except Exception:
             pass
-    
+        
         # In-memory spread history for percentile-based gating
-        self._spread_hist: list[tuple[float, float]] = []  # list of (epoch_seconds, spread_pips)
+        self._spread_hist = []  # list of (epoch_seconds, spread_pips)
+        # Track last good (non-zero) spread to avoid zero-artifact poisoning and allow fallback gates
+        self._last_valid_spread_pips = None
+        # Per-minute-of-hour spread history for p30 gating over ~N days
+        self._minute_spread_hist = {i: [] for i in range(60)}  # minute -> list[(ts, spread)]
+        self._minute_spread_window_days = 5
+        # Scalper heartbeat
+        self._last_scalp_check = 0.0
 
     # ----- Margin helpers -----
     def _fit_volume_to_margin(self, volume: float, order_type: int, price: float) -> float:
@@ -858,6 +1131,34 @@ class FXIFYTradingBot:
         now_ts = datetime.now(timezone.utc).timestamp()
         start_ts = math.floor(now_ts / SECONDS_PER_BAR) * SECONDS_PER_BAR
         return datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat()
+
+    # ----- Diagnostics helpers -----
+    def _log_r3_env(self, row: dict) -> None:
+        """Append a row to logs/r3_env.csv with environment diagnostics for the scalper (R3).
+
+        Expected keys: ts, symbol, regime, spread, p20, p30_min, sigma_ann, sigma_low, sigma_high,
+        in_london_ny, sp_ok, sig_ok, env_ok, adx, atr_pct.
+        """
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            path = os.path.join(LOG_DIR, "r3_env.csv")
+            write_header = not os.path.exists(path)
+            with open(path, mode="a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "ts", "symbol", "regime",
+                        "spread", "p20", "p30_min",
+                        "sigma_ann", "sigma_low", "sigma_high",
+                        "in_london_ny", "sp_ok", "sig_ok", "env_ok",
+                        "adx", "atr_pct",
+                    ],
+                )
+                if write_header:
+                    w.writeheader()
+                w.writerow(row)
+        except Exception as _e:
+            logger.debug(f"r3_env log failed: {_e}")
 
     def get_account_info(self) -> Optional[mt5.AccountInfo]:
         """Refresh account info"""
@@ -905,14 +1206,16 @@ class FXIFYTradingBot:
         if removed:
             logger.info(f"Cleaned up {removed} pending order(s)")
 
-    def _update_spread_history(self, spread_pips: float, window_minutes: int = 60) -> Optional[float]:
+    def _update_spread_history(self, spread_pips: Optional[float], window_minutes: int = 60) -> Optional[float]:
         """Track spread history and return the p20 threshold over the recent window in pips.
 
         Returns None until enough samples (>= 5) are collected in the window.
         """
         try:
             now_ts = time.time()
-            self._spread_hist.append((now_ts, float(spread_pips)))
+            # Only append valid positive spreads
+            if spread_pips is not None and float(spread_pips) > 0:
+                self._spread_hist.append((now_ts, float(spread_pips)))
             # Drop samples older than window
             cutoff = now_ts - window_minutes * 60
             self._spread_hist = [(t, s) for (t, s) in self._spread_hist if t >= cutoff]
@@ -920,6 +1223,35 @@ class FXIFYTradingBot:
             if len(vals) < 5:
                 return None
             return float(np.percentile(vals, 20.0))
+        except Exception:
+            return None
+
+    def _update_minute_spread_history(self, spread_pips: Optional[float], window_days: Optional[int] = None) -> Optional[float]:
+        """Update per-minute-of-hour spread history and return p30 for current minute.
+
+        We keep a rolling window of approximately `window_days` worth of samples per minute-of-hour.
+        Returns None until we have at least 4 samples for that minute.
+        """
+        try:
+            if window_days is None:
+                window_days = self._minute_spread_window_days
+            now_dt = datetime.now(timezone.utc)
+            m = now_dt.minute  # 0-59
+            # Append only valid spreads
+            if spread_pips is not None and float(spread_pips) > 0:
+                self._minute_spread_hist.setdefault(m, []).append((now_dt.timestamp(), float(spread_pips)))
+            # Trim old samples older than window_days
+            cutoff = (now_dt - timedelta(days=max(1, int(window_days)))).timestamp()
+            arr = self._minute_spread_hist.get(m, [])
+            arr = [(ts, sp) for (ts, sp) in arr if ts >= cutoff]
+            # Cap max length to avoid unbounded growth
+            if len(arr) > 5000:
+                arr = arr[-5000:]
+            self._minute_spread_hist[m] = arr
+            vals = [sp for (_, sp) in arr]
+            if len(vals) < 4:
+                return None
+            return float(np.percentile(vals, 30.0))
         except Exception:
             return None
     
@@ -1049,6 +1381,117 @@ class FXIFYTradingBot:
             break
         return False
     
+    def open_position_mr(self, direction: str, latest: pd.Series) -> bool:
+        """Open a position using MR sigma-based stop sizing."""
+        account = self.get_account_info()
+        if account is None:
+            return False
+
+        # MR sigma stop in price units
+        sigma = float(latest.get("mr_ewm_sigma", 0.0) or 0.0)
+        if sigma <= 0:
+            logger.info("MR: sigma not available or zero; skipping")
+            return False
+        stop_distance_price = MR_K_SIGMA_STOP * sigma
+        # Derive a dynamic TP using realized sigma (5m)
+        tp_price_dist = 0.0
+        try:
+            rates5 = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M5, 0, 120)
+            if rates5 is not None and len(rates5) > 0:
+                df5 = pd.DataFrame(rates5)
+                prices5 = df5['close'].astype(float)
+                sig_bar = realized_sigma(prices5, lookback=60)
+                price_now = float(latest.get("close", float(prices5.iloc[-1])))
+                pip = get_pip_value(self.symbol, self.symbol_info)
+                atr_pips = float(latest.get("atr", 0.0)) / max(pip, EPS)
+                sigma_pips = sigma_to_pips_realized(self.symbol, sig_bar, price_now)
+                sl_pips, tp_pips = dynamic_sl_tp(atr_pips, sigma_pips, k_sl=1.2, k_tp=1.8)
+                # Convert to price distances
+                stop_distance_price = sl_pips * pip
+                tp_price_dist = tp_pips * pip
+        except Exception:
+            pass
+        stop_distance_pips = max(stop_distance_price, EPS) / max(get_pip_value(self.symbol, self.symbol_info), EPS)
+
+        # Risk sizing
+        risk_pct = max(0.0, float(MR_RISK_PCT))
+        if CONCURRENT_RISK_CAP > 0:
+            risk_pct = min(risk_pct, CONCURRENT_RISK_CAP)
+
+        lots = calculate_lot_size(
+            self.symbol,
+            self.symbol_info,
+            account.equity,
+            risk_pct,
+            stop_distance_pips
+        )
+        lot_step = self.symbol_info.volume_step
+        lots = round(lots / lot_step) * lot_step
+        lots = max(self.symbol_info.volume_min, min(lots, self.symbol_info.volume_max))
+        if lots < self.symbol_info.volume_min:
+            logger.warning(f"MR: lot size {lots} below min {self.symbol_info.volume_min}")
+            return False
+
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            return False
+        if direction == "BUY":
+            order_type = mt5.ORDER_TYPE_BUY
+            price = tick.ask
+            stop_loss = price - stop_distance_price
+            take_profit = price + tp_price_dist if tp_price_dist > 0 else 0.0
+        else:
+            order_type = mt5.ORDER_TYPE_SELL
+            price = tick.bid
+            stop_loss = price + stop_distance_price
+            take_profit = price - tp_price_dist if tp_price_dist > 0 else 0.0
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "volume": lots,
+            "type": order_type,
+            "price": price,
+            "sl": stop_loss,
+            "tp": take_profit,
+            "deviation": 20,
+            "magic": MAGIC_NUMBER,
+            "comment": f"mr_z_{float(latest.get('mr_z', 0.0)):.2f}",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        logger.info(f"📈 [MR] Opening {direction}: {lots:.2f} lots, price={price:.5f}, SL={stop_loss:.5f}, z={float(latest.get('mr_z', 0.0)):.2f}")
+        result = _order_send_with_fallback(request, self.symbol)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(f"MR order failed: retcode={getattr(result,'retcode',None)}, comment={getattr(result,'comment','')}")
+            return False
+
+        exec_price = float(getattr(result, "price", 0.0) or 0.0)
+        if exec_price <= 0.0:
+            pos_after = self.get_position()
+            if pos_after is not None and float(getattr(pos_after, "price_open", 0.0) or 0.0) > 0.0:
+                exec_price = float(pos_after.price_open)
+            else:
+                exec_price = float(price)
+
+        self.state["in_position"] = True
+        self.state["position_qty"] = lots
+        self.state["position_ticket"] = result.order
+        self.state["entry_price"] = exec_price
+        self.state["entry_time"] = _utcnow_iso()
+        self.state["last_stop_price"] = stop_loss
+        # MR tracking for exits
+        self.state["mr_entry_bar_key"] = self._current_bar_key()
+        self.state["mr_bars_in_trade"] = 0
+        self.state["mr_z_entry"] = float(latest.get("mr_z", 0.0) or 0.0)
+        self.state["mr_sigma_entry"] = sigma
+        # Risk budget for logs
+        self.state["initial_risk"] = account.equity * risk_pct
+        self.state["added_risk"] = 0.0
+        save_state(self.state)
+        logger.info(f"✅ [MR] Position opened: ticket={result.order}, price={exec_price:.5f}")
+        return True
+
     def open_position(self, direction: str, latest: pd.Series) -> bool:
         """
         Open a position (BUY or SELL)
@@ -1057,11 +1500,29 @@ class FXIFYTradingBot:
         if account is None:
             return False
         
-        # Calculate stop loss distance
-        atr = latest["atr"]
-        stop_distance_atr = P["trailing_stop_atr_mult"] * atr
+        # Calculate ATR-based stop reference
+        atr = float(latest["atr"])  # price units
         pip_value = get_pip_value(self.symbol, self.symbol_info)
-        stop_distance_pips = stop_distance_atr / pip_value
+        atr_pips = atr / max(pip_value, EPS)
+
+        # 5m realized sigma for adaptive SL/TP
+        try:
+            rates5 = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M5, 0, 120)
+            if rates5 is not None and len(rates5) > 0:
+                df5 = pd.DataFrame(rates5)
+                prices5 = df5['close'].astype(float)
+                sig_bar = realized_sigma(prices5, lookback=60)
+                price_now = float(latest.get("close", float(prices5.iloc[-1])))
+                sigma_pips = sigma_to_pips_realized(self.symbol, sig_bar, price_now)
+            else:
+                sigma_pips = 0.0
+        except Exception:
+            sigma_pips = 0.0
+
+        # Dynamic SL/TP in pips with clamps to ATR
+        sl_pips, tp_pips = dynamic_sl_tp(atr_pips, sigma_pips, k_sl=1.2, k_tp=1.8)
+        # Convert pips back to price distance
+        stop_distance_atr = sl_pips * pip_value
         
         # Adaptive risk sizing
         # Base risk
@@ -1084,7 +1545,7 @@ class FXIFYTradingBot:
             self.symbol_info,
             account.equity,
             risk_pct,
-            stop_distance_pips
+            sl_pips
         )
         # JPY cap unless unusually tight stops (<= 0.8 ATR)
         if "JPY" in self.symbol.upper() and P["trailing_stop_atr_mult"] > 0.8:
@@ -1109,12 +1570,12 @@ class FXIFYTradingBot:
             order_type = mt5.ORDER_TYPE_BUY
             price = tick.ask
             stop_loss = price - stop_distance_atr
-            take_profit = 0.0  # We'll use trailing stop
+            take_profit = price + (tp_pips * pip_value) if tp_pips > 0 else 0.0
         else:  # SELL
             order_type = mt5.ORDER_TYPE_SELL
             price = tick.bid
             stop_loss = price + stop_distance_atr
-            take_profit = 0.0
+            take_profit = price - (tp_pips * pip_value) if tp_pips > 0 else 0.0
         
         # Prepare order request (stage 1)
         request = {
@@ -1203,12 +1664,17 @@ class FXIFYTradingBot:
             r_mult = (price - entry_price) / max(initial_r, EPS)
         else:
             r_mult = (entry_price - price) / max(initial_r, EPS)
-        if r_mult < 1.0:
+        # New rule: allow adds only if > 0.7R and ADX rising vs entry
+        adx_now = float(latest.get("adx", 0.0) or 0.0)
+        entry_adx = float(self.state.get("entry_adx", 0.0) or 0.0)
+        if (r_mult < 0.7) or (adx_now < entry_adx):
             return
         # Spread-aware block for adds
         try:
             sp = get_current_spread_pips(self.symbol, self.symbol_info)
-            if sp > ADD_SPREAD_BLOCK_PIPS:
+            # Stricter spread cap for adds (p25 proxy: use base cap minus 0.1)
+            add_cap = max(0.0, ADD_SPREAD_BLOCK_PIPS - 0.1)
+            if sp > add_cap:
                 logger.info(f"Add blocked by spread {sp:.2f} > {ADD_SPREAD_BLOCK_PIPS:.2f}")
                 return
         except Exception:
@@ -1223,7 +1689,9 @@ class FXIFYTradingBot:
         sym_cap = PYRAMID_MAX_TOTAL_RISK * equity
         conc_cap = CONCURRENT_RISK_CAP * equity
         headroom = min(sym_cap - current_sym_risk, conc_cap - current_sym_risk)
-        step_risk = min(PYRAMID_STEP_RISK * equity, headroom)
+        # Step risk 0.10% and max +0.30% per symbol
+        step_risk = min(0.001 * equity, headroom)
+        sym_cap = min(sym_cap, 0.003 * equity)
         if step_risk <= 0:
             return
         # Convert step risk to quantity using the same risk sizing logic as entries
@@ -1390,6 +1858,29 @@ class FXIFYTradingBot:
                 sys.exit(0)
             return
 
+        # Equity Guard v2: if daily PnL ≤ -2.5% and open DD > 1R, flatten and disable new entries for 60m
+        try:
+            day_start = float(self.state.get("day_start_equity", account.equity) or account.equity)
+            if day_start > 0:
+                day_pnl_pct = (float(account.equity) - day_start) / day_start
+            else:
+                day_pnl_pct = 0.0
+            self.state["day_pnl_pct"] = day_pnl_pct
+            save_state(self.state)
+            if day_pnl_pct <= -0.025:
+                pos = self.get_position()
+                if pos is not None:
+                    init_risk_dollars = float(self.state.get("initial_risk", 0.0) or 0.0)
+                    unrealized_loss = max(0.0, -float(getattr(pos, "profit", 0.0) or 0.0))
+                    if init_risk_dollars > 0 and unrealized_loss >= init_risk_dollars:
+                        logger.warning("EquityGuardV2: Day PnL <= -2.5% and open DD > 1R → flatten + disable entries for 60m")
+                        self.close_position(pos, "equity_guard_v2")
+                        disable_until = datetime.now(timezone.utc) + timedelta(minutes=60)
+                        self.state["equity_guard_until"] = disable_until.isoformat()
+                        save_state(self.state)
+        except Exception as _e:
+            logger.debug(f"EquityGuardV2 evaluation error: {_e}")
+
         # Daily stop handled via check_fxify_limits (uses FXIFY_MAX_DAILY_LOSS_PCT and DAY_RESET_TZ)
         
         # Check circuit breaker
@@ -1408,7 +1899,7 @@ class FXIFYTradingBot:
         logger.info(f"📊 Price: {latest['close']:.5f}, ATR: {latest['atr']:.5f}, ADX: {latest['adx']:.1f}, RSI: {latest['rsi']:.1f}")
         logger.info(f"🎯 Edge Score: {latest['edge_score']}/100 - {latest['edge_reasons']}")
         
-        # Determine if we are in off-hours; if ALWAYS_ACTIVE, bypass off-hours gates
+        # Determine if we are in off-hours; if ALWAYS_ACTIVE, bypass off-hours gates entirely
         is_active_now = _is_active_hour_utc(symbol=self.symbol)
         offhours = False
         if not is_active_now and not ALWAYS_ACTIVE:
@@ -1416,8 +1907,15 @@ class FXIFYTradingBot:
             logger.info("Outside active hours; applying off-hours safeguards")
 
         # Check spread (tighten caps in off-hours)
-        spread_pips = get_current_spread_pips(self.symbol, self.symbol_info)
-        logger.info(f"Spread: {spread_pips:.2f} pips")
+        spread_val = get_current_spread_pips(self.symbol, self.symbol_info)
+        # Normalize zeros: treat non-positive as missing for stats and percentile
+        spread_pips: Optional[float] = float(spread_val)
+        if spread_pips is None or spread_pips <= 0:
+            spread_pips = None
+            logger.debug("Spread measured as 0; treating as missing for stats and percentile.")
+        else:
+            self._last_valid_spread_pips = spread_pips
+        logger.info(f"Spread: {('n/a' if spread_pips is None else f'{spread_pips:.2f}')} pips")
         limit = _symbol_spread_limit(self.symbol)
         if offhours:
             up = self.symbol.upper()
@@ -1426,20 +1924,243 @@ class FXIFYTradingBot:
             elif up.startswith("EURUSD"):
                 limit = min(limit, OFFHOURS_SPREAD_EURUSD)
             logger.info(f"Off-hours spread cap: {limit:.2f} pips")
-        # Allow equality to pass to avoid false blocks at exact cap
-        if limit > 0 and spread_pips > limit:
-            logger.warning(f"Spread too high: {spread_pips:.2f} > {limit:.2f} pips")
+        # Allow equality to pass to avoid false blocks at exact cap; use last valid if current missing
+        spread_for_gate = spread_pips if spread_pips is not None else self._last_valid_spread_pips
+        if limit > 0 and (spread_for_gate is not None) and (spread_for_gate > limit):
+            logger.warning(f"Spread too high: {spread_for_gate:.2f} > {limit:.2f} pips")
             return
         # Percentile gate over last ~60 minutes (entry-only)
         block_entries_due_to_percentile = False
-        p20 = self._update_spread_history(spread_pips, window_minutes=60)
-        if p20 is not None and spread_pips > p20:
-            logger.info(f"Spread percentile gate: {spread_pips:.2f} pips > p20={p20:.2f} pips; entries will be skipped this bar")
+        # Update history only with valid positive values
+        p20 = self._update_spread_history(spread_pips, window_minutes=60) if (spread_pips is not None and spread_pips > 0) else self._update_spread_history(None, window_minutes=60)
+        if p20 is not None and (spread_for_gate is not None) and (spread_for_gate > p20):
+            logger.info(f"Spread percentile gate: {spread_for_gate:.2f} pips > p20={p20:.2f} pips; entries will be skipped this bar")
+            block_entries_due_to_percentile = True
+        # Per-minute-of-hour p30 gate over ~5 days
+        p30_min = self._update_minute_spread_history(spread_pips, window_days=self._minute_spread_window_days)
+        if p30_min is not None and (spread_for_gate is not None) and (spread_for_gate > p30_min):
+            logger.info(f"Spread minute-of-hour gate: {spread_for_gate:.2f} pips > p30(min {datetime.now(timezone.utc).minute:02d})={p30_min:.2f} pips; entries will be skipped this bar")
             block_entries_due_to_percentile = True
         
+        # ----- Global hard gates (force R0 and cancel scalps) -----
+        hard_gate = False
+        # Session gate (unless ALWAYS_ACTIVE)
+        if not ALWAYS_ACTIVE and not is_active_now:
+            hard_gate = True
+            logger.info("Hard gate: outside session window → R0")
+        # Spread cap (pair-specific hard cap)
+        try:
+            if spread_for_gate is not None and spread_for_gate > _pair_spread_hard_cap(self.symbol):
+                hard_gate = True
+                logger.info(f"Hard gate: spread {spread_for_gate:.2f} > hard cap {_pair_spread_hard_cap(self.symbol):.2f}")
+        except Exception:
+            pass
+        # Volatility floor (annualized sigma)
+        try:
+            sigma = float(latest.get("mr_ewm_sigma", 0.0) or 0.0)
+            price_now = float(latest.get("close", 0.0) or 0.0)
+            sigma_ann = annualize_sigma_percent(sigma, price_now, TIMEFRAME_STR)
+            vol_floor = _pair_vol_floor_percent(self.symbol)
+            if sigma_ann < vol_floor:
+                hard_gate = True
+                logger.info(f"Hard gate: σ_ann {sigma_ann:.3f}% < floor {vol_floor:.3f}%")
+        except Exception:
+            pass
+        # Risk caps: equity DD ≤ -4% or (approx) per-symbol concurrent risk > cap or loss streak >= 3
+        try:
+            init_bal = float(self.state.get("initial_balance", 0.0) or account.balance)
+            if init_bal > 0 and (account.equity - init_bal) / init_bal <= -0.04:
+                hard_gate = True
+                logger.info("Hard gate: equity drawdown ≤ -4%")
+        except Exception:
+            pass
+        try:
+            # Approx local risk exposure headroom using tracked initial_risk+added_risk
+            sym_risk = float(self.state.get("initial_risk", 0.0) or 0.0) + float(self.state.get("added_risk", 0.0) or 0.0)
+            if CONCURRENT_RISK_CAP > 0 and sym_risk > (CONCURRENT_RISK_CAP * account.equity):
+                hard_gate = True
+                logger.info("Hard gate: per-symbol concurrent risk exceeds cap; approximating portfolio headroom")
+        except Exception:
+            pass
+        try:
+            if int(self.state.get("loss_streak", 0) or 0) >= 3:
+                hard_gate = True
+                logger.info("Hard gate: 3-loss circuit breaker")
+        except Exception:
+            pass
+
+        # Cancel scalper entries if hard gate
+        if hard_gate:
+            self.state["regime"] = "R0"
+            # TODO: cancel pending scalper orders if implemented
+            save_state(self.state)
+
         # Get current position
         position = self.get_position()
         
+        # ----- Regime controller: compute signals and transitions -----
+        # Track 15m bar progression for cooldowns and counters
+        bar_key_15m = self._current_bar_key()
+        last_key_15m = self.state.get("_last_bar_key_15m")
+        new_bar_15m = last_key_15m != bar_key_15m
+        if new_bar_15m:
+            self.state["_last_bar_key_15m"] = bar_key_15m
+            # decrement cooldown if active
+            if int(self.state.get("regime_cooldown_bars", 0) or 0) > 0:
+                self.state["regime_cooldown_bars"] = int(self.state.get("regime_cooldown_bars", 0)) - 1
+            # increment bars_in counters
+            if self.state.get("regime") == "R1":
+                self.state["r1_bars_in"] = int(self.state.get("r1_bars_in", 0) or 0) + 1
+            if self.state.get("regime") == "R2":
+                self.state["r2_bars_in"] = int(self.state.get("r2_bars_in", 0) or 0) + 1
+            save_state(self.state)
+
+        # Compute MA_bps and sigma trend info
+        price_now = float(latest.get("close", 1.0) or 1.0)
+        short_ma = float(latest.get("short_ma", price_now))
+        long_ma = float(latest.get("long_ma", price_now))
+        ma_bps = abs(short_ma - long_ma) / max(price_now, EPS) * 10000.0
+        adx_val = float(latest.get("adx", 0.0) or 0.0)
+        atr_pct_val = float(latest.get("atr_pct", 0.0) or 0.0)
+        z_now = float(latest.get("mr_z", 0.0) or 0.0)
+        sigma_now = float(latest.get("mr_ewm_sigma", 0.0) or 0.0)
+        sigma_prev = float(self.state.get("last_sigma_ewm_15m", 0.0) or 0.0)
+        sigma_rising = sigma_now > sigma_prev and sigma_now > 0 and sigma_prev >= 0
+        # update sigma cache once per bar
+        if new_bar_15m:
+            self.state["last_sigma_ewm_15m"] = sigma_now
+            save_state(self.state)
+
+        # Pair-specific ATR% min for trend entry
+        atr_min_fx = 0.05
+        atr_min_xau = 0.08
+        is_xau = self.symbol.upper().startswith("XAU")
+        atr_min_used = atr_min_xau if is_xau else atr_min_fx
+
+        r1_ok_enter = (adx_val >= 24.0) and (ma_bps >= 2.0) and (sigma_rising or atr_pct_val >= atr_min_used)
+        r1_ok_stay = (adx_val >= 22.0) and (ma_bps >= 1.8)
+        r2_ok_enter = (adx_val <= 22.0) and (abs(z_now) >= abs(MR_Z_ENTRY))
+        r2_ok_stay = (adx_val <= 24.0) and (abs(z_now) > abs(MR_Z_EXIT))
+        # Entry confirmations buffer for R1 (2 bars)
+        if new_bar_15m:
+            try:
+                buf = list(self.state.get("r1_enter_buf", []))
+            except Exception:
+                buf = []
+            buf.append(bool(r1_ok_enter))
+            buf = buf[-2:]
+            self.state["r1_enter_buf"] = buf
+            save_state(self.state)
+        r1_confirm = all(self.state.get("r1_enter_buf", [False, False])) and len(self.state.get("r1_enter_buf", [])) >= 2
+
+        # Compute R3 scalper environment eligibility (London+NY, micro-spread <= p20, sigma band)
+        r3_env_ok = False
+        try:
+            # Session: London+NY
+            h = datetime.now(timezone.utc).hour
+            in_london_ny = 7 <= h <= 16
+            # Spread p20 gate
+            p20_now = self._update_spread_history(None, window_minutes=60)
+            sp_for = spread_for_gate
+            sp_ok = (sp_for is not None) and (p20_now is not None) and (sp_for <= p20_now)
+            # Sigma band on 1m by default for scalper env
+            scalp_tf = mt5.TIMEFRAME_M1 if SCALP_TF == mt5.TIMEFRAME_M1 else mt5.TIMEFRAME_M5
+            scalp_tf_str = "1Min" if scalp_tf == mt5.TIMEFRAME_M1 else "5Min"
+            sigma_ann = _compute_sigma_ann_percent_for_tf(self.symbol, scalp_tf, scalp_tf_str, span=60)
+            low, high = _scalp_sigma_band_percent(self.symbol)
+            sig_ok = (sigma_ann >= low) and (sigma_ann <= high)
+            r3_env_ok = in_london_ny and sp_ok and sig_ok
+            # Log diagnostics (use previously computed p30_min if available)
+            try:
+                self._log_r3_env({
+                    "ts": _utcnow_iso(),
+                    "symbol": self.symbol,
+                    "regime": self.state.get("regime", "R0"),
+                    "spread": None if sp_for is None else round(float(sp_for), 5),
+                    "p20": None if p20_now is None else round(float(p20_now), 5),
+                    "p30_min": None if ("p30_min" not in locals() or p30_min is None) else round(float(p30_min), 5),
+                    "sigma_ann": round(float(sigma_ann), 6),
+                    "sigma_low": round(float(low), 6),
+                    "sigma_high": round(float(high), 6),
+                    "in_london_ny": bool(in_london_ny),
+                    "sp_ok": bool(sp_ok),
+                    "sig_ok": bool(sig_ok),
+                    "env_ok": bool(r3_env_ok),
+                    "adx": round(float(adx_val), 3) if 'adx_val' in locals() else round(float(latest.get("adx", 0.0) or 0.0), 3),
+                    "atr_pct": round(float(atr_pct_val), 6) if 'atr_pct_val' in locals() else round(float(latest.get("atr_pct", 0.0) or 0.0), 6),
+                })
+            except Exception:
+                pass
+        except Exception:
+            r3_env_ok = False
+
+        # Regime transitions with priority
+        cur_regime = self.state.get("regime", "R0")
+        cdn = int(self.state.get("regime_cooldown_bars", 0) or 0)
+        def _switch(to_regime: str, cooldown_bars: int) -> None:
+            self.state["regime"] = to_regime
+            self.state["regime_cooldown_bars"] = cooldown_bars
+            if to_regime == "R1":
+                self.state["r1_bars_in"] = 0
+                self.state["r1_fail_streak"] = 0
+            if to_regime == "R2":
+                self.state["r2_bars_in"] = 0
+            save_state(self.state)
+
+        if hard_gate:
+            _switch("R0", 0)
+        else:
+            if cur_regime == "R0":
+                if cdn == 0 and r1_confirm:
+                    _switch("R1", 2)
+                elif cdn == 0 and r2_ok_enter:
+                    _switch("R2", 2)
+                elif cdn == 0 and r3_env_ok:
+                    _switch("R3", 1)
+            elif cur_regime == "R1":
+                # time stop 16 bars
+                if int(self.state.get("r1_bars_in", 0) or 0) >= 16:
+                    logger.info("R1 time-stop (16 bars) → R0")
+                    _switch("R0", 0)
+                elif not r1_ok_stay:
+                    # increment fail streak only once per bar
+                    if new_bar_15m:
+                        self.state["r1_fail_streak"] = int(self.state.get("r1_fail_streak", 0) or 0) + 1
+                        save_state(self.state)
+                    if int(self.state.get("r1_fail_streak", 0) or 0) >= 3:
+                        if r2_ok_enter:
+                            logger.info("R1 weakening → R2 handoff")
+                            _switch("R2", 2)
+                        else:
+                            logger.info("R1 weakening → R0")
+                            _switch("R0", 0)
+                else:
+                    # reset fail streak when healthy
+                    if new_bar_15m and int(self.state.get("r1_fail_streak", 0) or 0) > 0:
+                        self.state["r1_fail_streak"] = 0
+                        save_state(self.state)
+            elif cur_regime == "R2":
+                # handoff if trend emerges
+                if adx_val > 24.0:
+                    if r1_ok_enter:
+                        logger.info("R2 → R1 handoff")
+                        _switch("R1", 2)
+                    else:
+                        _switch("R0", 0)
+                elif not r2_ok_stay:
+                    logger.info("R2 exit → R0")
+                    _switch("R0", 0)
+                # time stop 8 bars (MR_TIME_STOP_BARS)
+                elif int(self.state.get("r2_bars_in", 0) or 0) >= MR_TIME_STOP_BARS:
+                    logger.info("R2 time-stop → R0")
+                    _switch("R0", 0)
+            elif cur_regime == "R3":
+                # Stay in R3 while env ok; otherwise drop to R0
+                if not r3_env_ok:
+                    _switch("R0", 0)
+
+        logger.info(f"Regime now: {self.state.get('regime')} (cooldown={self.state.get('regime_cooldown_bars')})")
+
         # POSITION MANAGEMENT
         if position:
             # Friendly position HUD: direction and lots
@@ -1561,8 +2282,31 @@ class FXIFYTradingBot:
             except Exception:
                 pass
 
-            # Update trailing stop
-            self.update_trailing_stop(position, latest)
+            # MR-specific management (exits) if regime is R2 (MR)
+            try:
+                if self.state.get("regime") == "R2":
+                    z_now = float(latest.get("mr_z", 0.0) or 0.0)
+                    # Time stop: increment bar count when new bar detected
+                    bar_key = self._current_bar_key()
+                    last_key = self.state.get("_last_bar_key_mr")
+                    if last_key != bar_key:
+                        self.state["_last_bar_key_mr"] = bar_key
+                        self.state["mr_bars_in_trade"] = int(self.state.get("mr_bars_in_trade", 0) or 0) + 1
+                        save_state(self.state)
+                    bars_in = int(self.state.get("mr_bars_in_trade", 0) or 0)
+                    if bars_in >= MR_TIME_STOP_BARS:
+                        self.close_position(position, "mr_time_stop")
+                        return
+                    # Z-exit: close when reverted to |z| <= z_exit
+                    if abs(z_now) <= MR_Z_EXIT:
+                        self.close_position(position, "mr_z_exit")
+                        return
+            except Exception as _e:
+                logger.debug(f"MR management skipped: {_e}")
+
+            # Update trailing stop (trend engine)
+            if self.state.get("regime") != "R2":
+                self.update_trailing_stop(position, latest)
             # Consider pyramiding
             self.maybe_add_pyramid(position, latest)
             
@@ -1611,6 +2355,19 @@ class FXIFYTradingBot:
             if not _cooldown_over(self.state, MIN_COOLDOWN_MIN):
                 logger.info(f"Cooldown period active ({MIN_COOLDOWN_MIN} min)")
                 return
+            # Equity Guard v2 disable window
+            try:
+                eg_until = self.state.get("equity_guard_until")
+                if eg_until:
+                    until_dt = datetime.fromisoformat(eg_until)
+                    if datetime.now(timezone.utc) < until_dt:
+                        remain = until_dt - datetime.now(timezone.utc)
+                        mins = int(remain.total_seconds() // 60)
+                        secs = int(remain.total_seconds() % 60)
+                        logger.info(f"EquityGuardV2 active; entries disabled for {mins}m {secs}s")
+                        return
+            except Exception:
+                pass
             
             # Check ATR regime filter
             if ATR_REGIME_WINDOW > 0 and ATR_REGIME_PCT > 0:
@@ -1631,8 +2388,66 @@ class FXIFYTradingBot:
                     logger.info(f"ATR% too high: {latest['atr_pct']:.3f}% > {ATR_PCT_MAX:.3f}%")
                 return
             
+            # MR engine entries (R2)
+            if self.state.get("regime") == "R2":
+                # Use latest ADX and z; require low-trend regime and sufficient deviation
+                adx_val = float(latest.get("adx", 0.0) or 0.0)
+                z_now = float(latest.get("mr_z", 0.0) or 0.0)
+                sigma_now = float(latest.get("mr_ewm_sigma", 0.0) or 0.0)
+                if sigma_now <= 0:
+                    logger.info("MR: sigma unavailable; skip")
+                    return
+                if adx_val > MR_ADX_MAX:
+                    logger.info(f"MR: ADX {adx_val:.1f} > max {MR_ADX_MAX:.1f}; skip")
+                    return
+                # RSI(5) reversal confirmation on 5m timeframe
+                rsi5_now = None
+                rsi5_prev = None
+                try:
+                    rates5 = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M5, 0, 50)
+                    if rates5 is not None and len(rates5) > 10:
+                        df5 = pd.DataFrame(rates5)
+                        rsi5_series = calculate_rsi(df5['close'].astype(float), 5)
+                        rsi5_now = float(rsi5_series.iloc[-1])
+                        rsi5_prev = float(rsi5_series.iloc[-2])
+                except Exception:
+                    rsi5_now = None
+                    rsi5_prev = None
+                # Dynamic thresholds: higher RSI delta in high sigma; lower z-entry when ADX weak
+                try:
+                    price_now_mr = float(latest.get("close", 0.0) or 0.0)
+                    sigma_ann15 = annualize_sigma_percent(sigma_now, price_now_mr, TIMEFRAME_STR)
+                    high_sig = sigma_ann15 >= (_pair_vol_floor_percent(self.symbol) * 1.5)
+                except Exception:
+                    high_sig = False
+                rsi_delta_thr = 1.2 if high_sig else 0.8
+                z_entry_thr = 1.0 if adx_val < 18.0 else abs(MR_Z_ENTRY)
+                # Decide direction
+                direction = None
+                if z_now <= -abs(z_entry_thr):
+                    # Require RSI(5) reversal up
+                    if rsi5_now is not None and rsi5_prev is not None:
+                        if (rsi5_now - rsi5_prev) >= rsi_delta_thr:
+                            direction = "BUY"
+                        else:
+                            logger.info(f"MR: BUY gated by RSI5 reversal (Δ={rsi5_now - rsi5_prev:.2f} < {rsi_delta_thr:.2f})")
+                    else:
+                        direction = "BUY"  # fallback if RSI unavailable
+                elif z_now >= abs(z_entry_thr):
+                    # Require RSI(5) reversal down
+                    if rsi5_now is not None and rsi5_prev is not None:
+                        if (rsi5_prev - rsi5_now) >= rsi_delta_thr:
+                            direction = "SELL"
+                        else:
+                            logger.info(f"MR: SELL gated by RSI5 reversal (Δ={rsi5_prev - rsi5_now:.2f} < {rsi_delta_thr:.2f})")
+                    else:
+                        direction = "SELL"  # fallback if RSI unavailable
+                if direction:
+                    self.open_position_mr(direction, latest)
+                return
+
             # Opportunistic entry with quality gates (ADX/MA/ATR)
-            if OPPORTUNISTIC_MODE:
+            if OPPORTUNISTIC_MODE and self.state.get("regime") == "R1":
                 # Quality gates
                 adx_val = float(latest.get("adx", 0))
                 used_adx_thr = max(P["adx_threshold"], OFFHOURS_ADX_MIN) if offhours else P["adx_threshold"]
@@ -1651,13 +2466,28 @@ class FXIFYTradingBot:
                     used_mabps_thr = max(MIN_MA_DIST_BPS, dyn_floor)
                 else:
                     used_mabps_thr = MIN_MA_DIST_BPS
+                # Effective MA-bps threshold with gentle ADX-based relaxation
+                EPS_BPS = 0.05  # leniency for near-miss with improving momentum
+                adx_relax = max(0.0, (adx_val - 25.0) * 0.02)
+                adx_relax = min(0.20, adx_relax)
+                eff_mabps_thr = max(0.0, used_mabps_thr - adx_relax)
+                # 1-bar ADX delta and RSI gate for epsilon acceptance
+                adx_prev = float(latest.get("prev_adx", adx_val))
+                d_adx = adx_val - adx_prev
+                rsi_val = float(latest.get("rsi", 0))
                 # MA normalization relative to dynamic floor
                 ma_norm = ma_dist_bps / max(dyn_floor, EPS)
                 if offhours:
-                    # Off-hours acceptance: either normalized MA distance is adequate or raw floor met
-                    ma_ok = (ma_norm >= MA_NORM_MIN_OFFHOURS) or (ma_dist_bps >= used_mabps_thr)
+                    # Off-hours acceptance: either normalized MA distance is adequate or threshold met
+                    ma_ok_base = (ma_norm >= MA_NORM_MIN_OFFHOURS) or (ma_dist_bps >= eff_mabps_thr)
                 else:
-                    ma_ok = ma_dist_bps >= used_mabps_thr
+                    ma_ok_base = ma_dist_bps >= eff_mabps_thr
+                # Off-hours: tighten MA threshold slightly
+                if offhours:
+                    eff_mabps_thr = eff_mabps_thr + 0.2
+                # Epsilon path: allow within EPS_BPS only if momentum is improving and RSI healthy (ΔADX >= 0.5)
+                ma_ok_eps = ((ma_dist_bps + EPS_BPS) >= eff_mabps_thr) and (d_adx >= 0.5) and (rsi_val >= 48.0)
+                ma_ok = ma_ok_base or ma_ok_eps
                 atr_val = atr_pct_val
                 atr_ok = (atr_val >= ATR_PCT_MIN) and (atr_val <= ATR_PCT_MAX)
                 # Strict off-hours exception path: require stronger conditions
@@ -1666,10 +2496,18 @@ class FXIFYTradingBot:
                     if adx_val < max(used_adx_thr, OFFHOURS_STRICT_ADX_MIN):
                         logger.info(f"Off-hours strict: ADX {adx_val:.1f} < {max(used_adx_thr, OFFHOURS_STRICT_ADX_MIN)}")
                         strict_ok = False
-                    if p20 is None or spread_pips > p20:
-                        logger.info(
-                            f"Off-hours strict: Spread {spread_pips:.2f} pips not <= p20 {p20:.2f} pips" if p20 is not None else "Off-hours strict: insufficient spread history for p20 gate"
-                        )
+                    if p20 is None or (spread_pips is not None and spread_pips > p20) or (p20 is not None and spread_pips is None and (self._last_valid_spread_pips is None or self._last_valid_spread_pips > p20)):
+                        if p20 is not None:
+                            sp_str = (
+                                f"{spread_pips:.2f}" if spread_pips is not None else (
+                                    "n/a" if self._last_valid_spread_pips is None else f"{self._last_valid_spread_pips:.2f}"
+                                )
+                            )
+                            logger.info(
+                                f"Off-hours strict: Spread {sp_str} pips not <= p20 {p20:.2f} pips"
+                            )
+                        else:
+                            logger.info("Off-hours strict: insufficient spread history for p20 gate")
                         strict_ok = False
                     if ma_norm < OFFHOURS_STRICT_MA_NORM:
                         logger.info(f"Off-hours strict: ma_norm {ma_norm:.2f} < {OFFHOURS_STRICT_MA_NORM}")
@@ -1678,7 +2516,7 @@ class FXIFYTradingBot:
                     strict_ok = True
                 gates_log = (
                     f"Gates: ADX {adx_val:.1f}>={used_adx_thr}:{adx_ok} | "
-                    f"MAbps {ma_dist_bps:.2f}>={used_mabps_thr:.2f}:{ma_ok} (ma_norm={ma_norm:.2f}, short={short_ma:.5f}, long={long_ma:.5f}, gap={ma_gap_raw:.5f}) | "
+                    f"MAbps {ma_dist_bps:.2f}>={eff_mabps_thr:.2f}:{ma_ok} (ma_norm={ma_norm:.2f}, short={short_ma:.5f}, long={long_ma:.5f}, gap={ma_gap_raw:.5f}) | "
                     f"ATR% band {ATR_PCT_MIN:.2f}%–{ATR_PCT_MAX:.2f}%: {atr_val:.3f}% -> {atr_ok}"
                 )
                 if not ALWAYS_ACTIVE:
@@ -1712,14 +2550,34 @@ class FXIFYTradingBot:
                 if not (adx_ok and ma_ok and atr_ok and strict_ok):
                     self.state["edge_buy_streak"] = 0
                     # Log the actual MA threshold used (adaptive or static) for clarity
-                    logger.info(
+                    short_by = max(0.0, eff_mabps_thr - ma_dist_bps)
+                    msg = (
                         f"Quality gates blocked entry: ADX>={used_adx_thr}:{adx_ok}, "
-                        f"MAbps>={used_mabps_thr}:{ma_ok}, ATR% band [{ATR_PCT_MIN},{ATR_PCT_MAX}]:{atr_ok}, Off-hours strict:{strict_ok}"
+                        f"MAbps>={eff_mabps_thr}:{ma_ok} (short by {short_by:.2f} bps), "
+                        f"ATR% band [{ATR_PCT_MIN},{ATR_PCT_MAX}]:{atr_ok}"
                     )
+                    if not ALWAYS_ACTIVE:
+                        msg += f", Off-hours strict:{strict_ok}"
+                    logger.info(msg)
                     return
                 # Use a potentially different buy score threshold during off-hours
                 used_edge_buy_score = OFFHOURS_EDGE_BUY_SCORE if offhours else EDGE_BUY_SCORE
-                if latest["edge_score"] >= used_edge_buy_score:
+                # Additional 2-bar confirm for EURUSD to avoid low-quality drifts
+                eurusd_confirm_ok = True
+                if self.symbol.upper().startswith("EURUSD"):
+                    eurusd_cond = (adx_val >= 20.0) and (d_adx >= 0.0) and (ATR_PCT_MIN <= atr_val <= ATR_PCT_MAX) and (rsi_val >= 48.0)
+                    try:
+                        buf = self.state.get("eurusd_confirm_buf", [])
+                        buf.append(bool(eurusd_cond))
+                        # Keep last 3 flags
+                        buf = buf[-3:]
+                        self.state["eurusd_confirm_buf"] = buf
+                        eurusd_confirm_ok = (len(buf) >= 2) and all(buf[-2:])
+                    except Exception:
+                        eurusd_confirm_ok = eurusd_cond
+                    if not eurusd_confirm_ok:
+                        logger.info("EURUSD confirm not satisfied (need 2 consecutive bars: ADX>=20, ΔADX>=0, ATR% in band, RSI>=48)")
+                if latest["edge_score"] >= used_edge_buy_score and eurusd_confirm_ok:
                     self.state["edge_buy_streak"] = self.state.get("edge_buy_streak", 0) + 1
                 else:
                     self.state["edge_buy_streak"] = 0
@@ -1765,6 +2623,30 @@ class FXIFYTradingBot:
                     direction = "BUY" if uptrend else "SELL"
                     self.open_position(direction, latest)
                     return
+
+            # R3 scalper environment evaluation (no-op entry wiring here)
+            if SCALP_ENABLE:
+                # London+NY session approximation: 07:00–16:00 UTC
+                h = datetime.now(timezone.utc).hour
+                in_london_ny = 7 <= h <= 16
+                sp_cap = _scalp_spread_hard_cap(self.symbol)
+                sp_ok = (spread_for_gate is not None) and (spread_for_gate <= sp_cap)
+                # Sigma band on SCALP_TF
+                if SCALP_TF == mt5.TIMEFRAME_M1:
+                    scalp_tf_str = "1Min"
+                elif SCALP_TF == mt5.TIMEFRAME_M5:
+                    scalp_tf_str = "5Min"
+                else:
+                    scalp_tf_str = SCALP_TF_STR
+                sigma_ann = _compute_sigma_ann_percent_for_tf(self.symbol, SCALP_TF, scalp_tf_str, span=60)
+                low, high = _scalp_sigma_band_percent(self.symbol)
+                sig_ok = (sigma_ann >= low) and (sigma_ann <= high)
+                env_ok = in_london_ny and sp_ok and sig_ok
+                self.state["r3_env_ok"] = env_ok
+                if env_ok:
+                    logger.info(f"R3 env OK: London+NY, spread {spread_for_gate:.2f}<= {sp_cap:.2f}, σ_ann {sigma_ann:.2f}% in [{low:.2f},{high:.2f}]%")
+                else:
+                    logger.info(f"R3 env NO: session={in_london_ny}, spread={('n/a' if spread_for_gate is None else f'{spread_for_gate:.2f}>{sp_cap:.2f}')}, σ_ann={sigma_ann:.2f}% not in [{low:.2f},{high:.2f}]%")
         
         logger.info("✅ Iteration complete")
     
@@ -1831,6 +2713,27 @@ class FXIFYTradingBot:
 
     def manage_midbar(self) -> None:
         """Lightweight management between bars: fuse trims and BE/trailing using entry ATR."""
+        # Run scalper checker under safe toggle and cooldown
+        try:
+            if SCALP_ENABLE:
+                now_ts = time.time()
+                if now_ts - self._last_scalp_check >= max(5, SCALP_COOLDOWN_SEC):
+                    self._last_scalp_check = now_ts
+                    self._check_and_trade_scalper()
+        except Exception as _e:
+            logger.debug(f"scalper check error: {_e}")
+        # Scalper max-hold enforcement (20 minutes)
+        try:
+            sp = self._get_scalp_position()
+            if sp is not None:
+                et = self.state.get("scalp_entry_time")
+                if et:
+                    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(et)).total_seconds()
+                    if elapsed >= 20 * 60:
+                        self._close_scalp_position("scalp_max_hold")
+        except Exception as _e:
+            logger.debug(f"scalp max-hold check error: {_e}")
+
         position = self.get_position()
         if not position:
             return
@@ -1901,6 +2804,219 @@ class FXIFYTradingBot:
                         self._modify_position_sl(position, new_stop)
         except Exception as _e:
             logger.debug(f"manage_midbar error: {_e}")
+
+    # ===================== SCALPER =====================
+    def _fetch_bars_df(self, timeframe: int, count: int = 300) -> Optional[pd.DataFrame]:
+        try:
+            rates = mt5.copy_rates_from_pos(self.symbol, timeframe, 0, count)
+            if rates is None or len(rates) == 0:
+                return None
+            df = pd.DataFrame(rates)
+            df["time"] = pd.to_datetime(df["time"], unit="s")
+            df.set_index("time", inplace=True)
+            out = df[["open", "high", "low", "close"]].copy()
+            return out
+        except Exception:
+            return None
+
+    def _get_scalper_signal(self, df: pd.DataFrame) -> Tuple[bool, Optional[str], Optional[str]]:
+        params = ScalpParams(
+            timeframe="5m" if SCALP_TF == mt5.TIMEFRAME_M5 else "1m",
+            entry_logic=SCALP_ENTRY_LOGIC,
+            rsi_entry_long=SCALP_RSI_ENTRY_LONG,
+            rsi_exit_long=SCALP_RSI_EXIT_LONG,
+            rsi_entry_short=SCALP_RSI_ENTRY_SHORT,
+            rsi_exit_short=SCALP_RSI_EXIT_SHORT,
+            macd_signal_cross=SCALP_MACD_SIGNAL_CROSS,
+            momentum_threshold=SCALP_MOMENTUM_THRESHOLD,
+            tp_pips=SCALP_TP_PIPS,
+            sl_pips=SCALP_SL_PIPS,
+            risk_per_trade=SCALP_RISK_PCT,
+            session_filter=(SCALP_SESSION_FILTER or None),
+        )
+        if SCALP_ENTRY_LOGIC.upper() == "RSI+MOMENTUM":
+            return rsi_momentum_signal(df, params)
+        return rsi_macd_signal(df, params)
+
+    def _get_scalp_position(self) -> Optional[mt5.TradePosition]:
+        try:
+            positions = mt5.positions_get(symbol=self.symbol)
+            if positions:
+                for p in positions:
+                    try:
+                        if int(getattr(p, "magic", 0)) == MAGIC_NUMBER_SCALP:
+                            return p
+                    except Exception:
+                        continue
+        except Exception:
+            return None
+        return None
+
+    def _check_and_trade_scalper(self) -> None:
+        # Skip if not allowed by prop limits
+        acc = self.get_account_info()
+        if acc is None:
+            return
+        ok, reason, code = check_fxify_limits(self.state, acc)
+        if not ok:
+            return
+        # Only act when router is in R3 and environment OK
+        if self.state.get("regime") != "R3" or not bool(self.state.get("r3_env_ok", False)):
+            return
+        # Loss-streak pause for scalper only
+        try:
+            sc_cool = self.state.get("scalp_cooldown_until")
+            if sc_cool and datetime.now(timezone.utc) < datetime.fromisoformat(sc_cool):
+                return
+            if int(self.state.get("scalp_loss_streak", 0) or 0) >= 2:
+                # Impose temporary cooldown of 30 minutes
+                self.state["scalp_cooldown_until"] = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+                save_state(self.state)
+                return
+        except Exception:
+            pass
+        # Respect active hours unless ALWAYS_ACTIVE
+        if not _is_active_hour_utc(symbol=self.symbol) and not ALWAYS_ACTIVE:
+            return
+        # Spread gate: use stricter cap for scalper
+        try:
+            base_cap = _symbol_spread_limit(self.symbol)
+        except Exception:
+            base_cap = MAX_SPREAD_PIPS
+        spread_cap = max(0.1, base_cap * SCALP_SPREAD_CAP_MULT)
+        sp_now = get_current_spread_pips(self.symbol, self.symbol_info)
+        # Also require sp <= p20 recent; stricter: use min(p20, 0.8×cap) when available
+        p20 = self._update_spread_history(None, window_minutes=60)
+        p20_eff = None
+        try:
+            if p20 is not None:
+                p20_eff = min(float(p20), float(spread_cap) * 0.8)
+        except Exception:
+            p20_eff = p20
+        if sp_now > spread_cap or (p20_eff is not None and sp_now > p20_eff):
+            logger.info(f"[scalp] Spread {sp_now:.2f} > gate {(p20_eff if p20_eff is not None else spread_cap):.2f}; skip")
+            return
+        # Directional alignment with 15m trend
+        latest15 = fetch_bars_and_indicators(self.symbol, TIMEFRAME)
+        long_ok = False
+        short_ok = False
+        adx_rising = True
+        try:
+            if latest15 is not None:
+                long_ok = float(latest15.get("close", 0.0)) >= float(latest15.get("trend_ma", 0.0))
+                short_ok = float(latest15.get("close", 0.0)) <= float(latest15.get("trend_ma", 0.0))
+                adx_now15 = float(latest15.get("adx", 0.0) or 0.0)
+                adx_prev15 = float(latest15.get("prev_adx", adx_now15) or adx_now15)
+                adx_rising = (adx_now15 - adx_prev15) >= 0.5
+        except Exception:
+            adx_rising = True
+        # If a scalper position already exists, do nothing
+        if self._get_scalp_position() is not None:
+            return
+        # Load lower timeframe bars
+        df = self._fetch_bars_df(SCALP_TF, count=200)
+        if df is None or len(df) < 50:
+            logger.debug("[scalp] No bars")
+            return
+        has_sig, direction, why = self._get_scalper_signal(df)
+        if not has_sig or direction not in ("long", "short"):
+            return
+        # Enforce directional alignment and momentum (ADX rising)
+        if not adx_rising:
+            return
+        if direction == "long" and not long_ok:
+            return
+        if direction == "short" and not short_ok:
+            return
+        # Place market order with fixed SL/TP
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            return
+        order_type = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
+        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+        pip = get_pip_value(self.symbol, self.symbol_info)
+        # Volatility-adaptive SL: widen by 20% in high sigma regime
+        try:
+            scalp_tf = SCALP_TF
+            scalp_tf_str = "1Min" if scalp_tf == mt5.TIMEFRAME_M1 else ("5Min" if scalp_tf == mt5.TIMEFRAME_M5 else SCALP_TF_STR)
+            sigma_ann = _compute_sigma_ann_percent_for_tf(self.symbol, scalp_tf, scalp_tf_str, span=60)
+            low, high = _scalp_sigma_band_percent(self.symbol)
+            widen = 1.2 if sigma_ann >= (low + high) / 2.0 else 1.0
+        except Exception:
+            widen = 1.0
+        sl_pips_eff = SCALP_SL_PIPS * widen
+        sl = price - sl_pips_eff * pip if order_type == mt5.ORDER_TYPE_BUY else price + sl_pips_eff * pip
+        tp = price + SCALP_TP_PIPS * pip if order_type == mt5.ORDER_TYPE_BUY else price - SCALP_TP_PIPS * pip
+        # Size by risk % and stop distance
+        lots = calculate_lot_size(self.symbol, self.symbol_info, acc.equity, SCALP_RISK_PCT, sl_pips_eff)
+        lots = self._fit_volume_to_margin(lots, order_type, price)
+        if lots < self.symbol_info.volume_min:
+            logger.info("[scalp] insufficient margin for min lot; skip")
+            return
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "volume": lots,
+            "type": order_type,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": 20,
+            "magic": MAGIC_NUMBER_SCALP,
+            "comment": f"scalp_{SCALP_ENTRY_LOGIC}",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        res = _order_send_with_fallback(req, self.symbol)
+        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            logger.info(f"[scalp] Opened {direction.upper()} {lots:.2f} lots @ {price:.5f} | SL {sl:.5f} TP {tp:.5f} | {why}")
+            self.state["scalp_in_position"] = True
+            self.state["scalp_qty"] = lots
+            self.state["scalp_entry_price"] = price
+            self.state["scalp_entry_time"] = _utcnow_iso()
+            self.state["scalp_ticket"] = getattr(res, "order", None)
+            save_state(self.state)
+        
+    def _close_scalp_position(self, reason: str = "scalp_close") -> bool:
+        pos = self._get_scalp_position()
+        if pos is None:
+            return False
+        order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        tick = mt5.symbol_info_tick(self.symbol)
+        if not tick:
+            return False
+        price = tick.bid if order_type == mt5.ORDER_TYPE_SELL else tick.ask
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "volume": pos.volume,
+            "type": order_type,
+            "position": pos.ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": MAGIC_NUMBER_SCALP,
+            "comment": reason,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        res = _order_send_with_fallback(req, self.symbol)
+        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            # Update scalp loss streak from profit field
+            try:
+                if float(getattr(pos, "profit", 0.0) or 0.0) < 0:
+                    self.state["scalp_loss_streak"] = int(self.state.get("scalp_loss_streak", 0) or 0) + 1
+                else:
+                    self.state["scalp_loss_streak"] = 0
+            except Exception:
+                pass
+            self.state["scalp_in_position"] = False
+            self.state["scalp_qty"] = 0.0
+            self.state["scalp_ticket"] = None
+            self.state["scalp_entry_time"] = None
+            save_state(self.state)
+            logger.info(f"[scalp] Closed position: {reason}")
+            return True
+        return False
 
 # ===================== MAIN =====================
 
